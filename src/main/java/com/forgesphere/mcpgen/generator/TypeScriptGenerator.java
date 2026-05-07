@@ -1,0 +1,459 @@
+package com.forgesphere.mcpgen.generator;
+
+import com.forgesphere.mcpgen.model.McpProject;
+import com.forgesphere.mcpgen.model.McpProject.GeneratedFile;
+import com.forgesphere.mcpgen.model.McpProject.Tool;
+import org.springframework.stereotype.Component;
+
+import java.util.ArrayList;
+import java.util.LinkedHashMap;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * TypeScript / Node.js MCP server generator.
+ *
+ * Emits a ready-to-run project using `@modelcontextprotocol/sdk`. The
+ * template handles all three transports (stdio, streamable-http,
+ * http-sse) and all four auth modes (none, bearer, api-key, custom).
+ *
+ * Per-tool files under `src/tools/` so large servers stay navigable.
+ * One tools/index.ts wires them up.
+ */
+@Component
+public class TypeScriptGenerator implements CodeGenerator {
+
+    @Override public String language() { return "typescript"; }
+
+    @Override
+    public List<GeneratedFile> generate(McpProject spec) {
+        var id   = spec.getIdentity();
+        var caps = spec.getCapabilities();
+        var rt   = spec.getRuntime();
+        var t    = spec.getTransport();
+        var a    = spec.getAuth();
+        String sdkVersion = rt == null || rt.getSdkVersion() == null ? "^1.0.0" : rt.getSdkVersion();
+
+        List<GeneratedFile> files = new ArrayList<>();
+
+        // ---- package.json ----
+        Map<String, Object> pkg = new LinkedHashMap<>();
+        pkg.put("name", id == null ? "mcp-server" : id.getSlug());
+        pkg.put("version", "0.1.0");
+        pkg.put("description", id == null ? "" : id.getSummary());
+        pkg.put("type", "module");
+        pkg.put("main", "dist/index.js");
+        Map<String, String> scripts = new LinkedHashMap<>();
+        scripts.put("build", "tsc -p .");
+        scripts.put("start", t != null && "stdio".equals(t.getKind()) ? "node dist/index.js" : "node dist/index.js");
+        scripts.put("dev",   "tsx watch src/index.ts");
+        pkg.put("scripts", scripts);
+        Map<String, String> deps = new LinkedHashMap<>();
+        deps.put("@modelcontextprotocol/sdk", sdkVersion);
+        deps.put("zod", "^3.23.8");
+        if (t != null && !"stdio".equals(t.getKind())) deps.put("express", "^4.19.2");
+        pkg.put("dependencies", deps);
+        Map<String, String> devDeps = new LinkedHashMap<>();
+        devDeps.put("typescript", "^5.4.0");
+        devDeps.put("tsx", "^4.7.0");
+        devDeps.put("@types/node", "^20.11.0");
+        if (t != null && !"stdio".equals(t.getKind())) devDeps.put("@types/express", "^4.17.21");
+        pkg.put("devDependencies", devDeps);
+        files.add(file("package.json", GeneratorUtils.pretty(pkg), "json"));
+
+        // ---- tsconfig.json ----
+        String tsconfig = """
+                {
+                  "compilerOptions": {
+                    "target": "ES2022",
+                    "module": "NodeNext",
+                    "moduleResolution": "NodeNext",
+                    "outDir": "dist",
+                    "rootDir": "src",
+                    "strict": true,
+                    "esModuleInterop": true,
+                    "skipLibCheck": true,
+                    "resolveJsonModule": true
+                  },
+                  "include": ["src/**/*"]
+                }
+                """;
+        files.add(file("tsconfig.json", tsconfig, "json"));
+
+        // ---- src/index.ts (transport bootstrap) ----
+        files.add(file("src/index.ts", indexFile(spec), "typescript"));
+
+        // ---- src/server.ts (capability registration) ----
+        files.add(file("src/server.ts", serverFile(spec), "typescript"));
+
+        // ---- src/tools/<each>.ts ----
+        if (caps != null) {
+            for (Tool tool : caps.getTools()) {
+                String fname = "src/tools/" + GeneratorUtils.sanitise(tool.getName()) + ".ts";
+                files.add(file(fname, toolFile(tool), "typescript"));
+            }
+            if (!caps.getTools().isEmpty()) {
+                files.add(file("src/tools/index.ts", toolsIndex(caps.getTools()), "typescript"));
+            }
+        }
+
+        // ---- .env.example ----
+        files.add(file(".env.example", GeneratorUtils.envExample(spec), "dotenv"));
+
+        // ---- Dockerfile ----
+        files.add(file("Dockerfile", GeneratorUtils.dockerfile(spec), "docker"));
+
+        // ---- mcp.json (ForgeQ catalog manifest) ----
+        files.add(file("mcp.json", GeneratorUtils.pretty(GeneratorUtils.manifest(spec)), "json"));
+
+        // ---- README.md ----
+        files.add(file("README.md", GeneratorUtils.commonReadme(spec) + tsQuickStart(t, a), "markdown"));
+
+        // ---- .gitignore ----
+        files.add(file(".gitignore", "node_modules/\ndist/\n.env\n.DS_Store\n", "gitignore"));
+
+        // ---- tests/ (Vitest stubs — one case per tool) ----
+        if (caps != null && !caps.getTools().isEmpty()) {
+            StringBuilder test = new StringBuilder();
+            test.append("import { describe, it, expect } from \"vitest\";\n");
+            for (Tool tool : caps.getTools()) {
+                String fn = GeneratorUtils.sanitise(tool.getName());
+                test.append("import { ").append(fn).append("Handler } from \"../src/tools/").append(fn).append("\";\n");
+            }
+            test.append("\n");
+            for (Tool tool : caps.getTools()) {
+                String fn = GeneratorUtils.sanitise(tool.getName());
+                test.append("describe(\"").append(tool.getName()).append("\", () => {\n");
+                test.append("  it(\"returns a content array\", async () => {\n");
+                test.append("    const result = await ").append(fn).append("Handler({} as any);\n");
+                test.append("    expect(result).toBeTruthy();\n");
+                test.append("    expect(result.content).toBeDefined();\n");
+                test.append("    expect(Array.isArray(result.content)).toBe(true);\n");
+                test.append("  });\n});\n\n");
+            }
+            files.add(file("tests/tools.test.ts", test.toString(), "typescript"));
+            files.add(file("vitest.config.ts",
+                    "import { defineConfig } from \"vitest/config\";\n" +
+                    "export default defineConfig({ test: { environment: \"node\", globals: true } });\n", "typescript"));
+        }
+
+
+        // Senior dev's pipeline picks this workflow up — pushes the
+        // image to the registry and rolls out a deploy. Same shape
+        // across all languages.
+        files.add(GeneratedFile.builder()
+                .path(".github/workflows/mcp.yml")
+                .content(GeneratorUtils.buildGithubWorkflow(spec))
+                .mimeHint("text/yaml")
+                .build());
+
+        return files;
+    }
+
+    // --------------------- templates ---------------------
+
+    private String indexFile(McpProject spec) {
+        var t = spec.getTransport();
+        var a = spec.getAuth();
+        var adv = spec.getAdvanced();
+        boolean hasAuth = a != null && !"none".equalsIgnoreCase(a.getKind());
+        String kind = t == null ? "streamable-http" : t.getKind();
+
+        if ("stdio".equals(kind)) {
+            return """
+                    import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+                    import { server } from "./server.js";
+
+                    // STDIO transport — LLM clients (Claude Desktop, Cursor) launch this
+                    // process and talk to it over stdin/stdout.
+                    const transport = new StdioServerTransport();
+                    await server.connect(transport);
+                    """;
+        }
+
+        // Build the HTTP transport bootstrap piece by piece based on advanced opts.
+        boolean corsOn     = adv == null || adv.getCors() == null       || adv.getCors().isEnabled();
+        String  corsOrig   = adv == null || adv.getCors() == null       ? "*" : (adv.getCors().getAllowedOrigins() == null ? "*" : adv.getCors().getAllowedOrigins());
+        boolean rlOn       = adv != null && adv.getRateLimit()  != null && adv.getRateLimit().isEnabled();
+        int     rlRpm      = adv == null || adv.getRateLimit()  == null ? 60 : adv.getRateLimit().getRequestsPerMinute();
+        boolean logOn      = adv == null || adv.getLogging()    == null || adv.getLogging().isEnabled();
+        boolean healthOn   = adv == null || adv.getHealthCheck()== null || adv.getHealthCheck().isEnabled();
+        String  healthPath = adv == null || adv.getHealthCheck()== null ? "/healthz" : adv.getHealthCheck().getPath();
+        boolean metricsOn  = adv != null && adv.getMetrics()    != null && adv.getMetrics().isEnabled();
+        String  metricsPath= adv == null || adv.getMetrics()    == null ? "/metrics" : adv.getMetrics().getPath();
+
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+                import express from "express";
+                import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
+                import { server } from "./server.js";
+
+                const app = express();
+                app.use(express.json());
+                """);
+
+        if (logOn) sb.append("""
+
+                // Structured request logging.
+                app.use((req, _res, next) => {
+                  const t0 = Date.now();
+                  _res.on("finish", () => {
+                    console.log(JSON.stringify({ ts: new Date().toISOString(), method: req.method, path: req.path, status: _res.statusCode, ms: Date.now() - t0 }));
+                  });
+                  next();
+                });
+                """);
+
+        if (corsOn) sb.append("""
+
+                // CORS.
+                const ALLOWED_ORIGINS = %s;
+                app.use((req, res, next) => {
+                  const origin = req.headers.origin || "";
+                  const allow = ALLOWED_ORIGINS === "*" ? "*" : (ALLOWED_ORIGINS.split(",").map((s: string) => s.trim()).includes(origin) ? origin : "");
+                  if (allow) res.setHeader("Access-Control-Allow-Origin", allow);
+                  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+                  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                  if (req.method === "OPTIONS") return res.sendStatus(204);
+                  next();
+                });
+                """.formatted("\"" + corsOrig.replace("\"", "\\\"") + "\""));
+
+        if (rlOn) sb.append("""
+
+                // Naive in-memory rate limiter — swap for Redis if you scale out.
+                const RATE_LIMIT_PER_MIN = %d;
+                const buckets = new Map<string, { count: number; resetAt: number }>();
+                app.use((req, res, next) => {
+                  const ip = (req.ip || req.socket.remoteAddress || "") as string;
+                  const now = Date.now();
+                  const b = buckets.get(ip) || { count: 0, resetAt: now + 60_000 };
+                  if (now > b.resetAt) { b.count = 0; b.resetAt = now + 60_000; }
+                  b.count++; buckets.set(ip, b);
+                  if (b.count > RATE_LIMIT_PER_MIN) return res.status(429).json({ error: "rate limit exceeded" });
+                  next();
+                });
+                """.formatted(rlRpm));
+
+        if (hasAuth) sb.append("""
+
+                function requireAuth(req: any, res: any, next: any) {
+                  const header = req.headers["authorization"] || "";
+                  const expected = `Bearer ${process.env.MCP_AUTH_TOKEN || ""}`;
+                  if (!process.env.MCP_AUTH_TOKEN || header !== expected) {
+                    return res.status(401).json({ error: "unauthorized" });
+                  }
+                  next();
+                }
+                """);
+
+        if (healthOn) sb.append("""
+
+                app.get(%s, (_req, res) => res.json({ ok: true }));
+                """.formatted("\"" + healthPath + "\""));
+
+        if (metricsOn) sb.append("""
+
+                // Simple Prometheus-compatible metrics.
+                let totalRequests = 0;
+                app.use((_req, _res, next) => { totalRequests++; next(); });
+                app.get(%s, (_req, res) => {
+                  res.type("text/plain").send(`# TYPE mcp_requests_total counter\\nmcp_requests_total ${totalRequests}\\n`);
+                });
+                """.formatted("\"" + metricsPath + "\""));
+
+        sb.append("""
+
+                const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
+                await server.connect(transport);
+                """);
+
+        if (hasAuth) sb.append("app.use(requireAuth);\n");
+
+        sb.append("""
+                app.all("/mcp", async (req, res) => { await transport.handleRequest(req, res, req.body); });
+
+                const port = Number(process.env.PORT || 3500);
+                app.listen(port, () => { console.log(`MCP server listening on http://localhost:${port}/mcp`); });
+                """);
+
+        return sb.toString();
+    }
+
+    private String serverFile(McpProject spec) {
+        var id   = spec.getIdentity();
+        var caps = spec.getCapabilities();
+        StringBuilder sb = new StringBuilder();
+        sb.append("""
+                import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+                import { z } from "zod";
+
+                export const server = new McpServer({
+                """);
+        sb.append("  name: ").append(quote(id == null ? "mcp-server" : id.getDisplayName())).append(",\n");
+        sb.append("  version: \"0.1.0\",\n");
+        sb.append("});\n\n");
+
+        if (caps != null && !caps.getTools().isEmpty()) {
+            sb.append("// ---------- Tools ----------\n");
+            for (Tool tool : caps.getTools()) {
+                String fnName = GeneratorUtils.sanitise(tool.getName());
+                sb.append("import { ").append(fnName).append("Handler } from \"./tools/").append(fnName).append(".js\";\n");
+            }
+            sb.append('\n');
+            for (Tool tool : caps.getTools()) {
+                String fnName = GeneratorUtils.sanitise(tool.getName());
+                sb.append("server.registerTool(").append(quote(tool.getName())).append(", {\n");
+                sb.append("  description: ").append(quote(nz(tool.getDescription()))).append(",\n");
+                sb.append("  inputSchema: ").append(zodShapeFromSchema(tool.getInputSchema())).append(",\n");
+                sb.append("}, ").append(fnName).append("Handler);\n\n");
+            }
+        }
+        if (caps != null && !caps.getResources().isEmpty()) {
+            sb.append("// ---------- Resources ----------\n");
+            for (var r : caps.getResources()) {
+                sb.append("server.registerResource(").append(quote(r.getName())).append(", ")
+                        .append(quote(r.getUriTemplate())).append(", {\n");
+                sb.append("  description: ").append(quote(nz(r.getDescription()))).append(",\n");
+                sb.append("  mimeType: ").append(quote(nz(r.getMimeType()))).append(",\n");
+                sb.append("}, async (uri) => ({\n  contents: [{ uri: uri.href, text: \"TODO: return resource contents\" }]\n}));\n\n");
+            }
+        }
+        if (caps != null && !caps.getPrompts().isEmpty()) {
+            sb.append("// ---------- Prompts ----------\n");
+            for (var p : caps.getPrompts()) {
+                sb.append("server.registerPrompt(").append(quote(p.getName())).append(", {\n");
+                sb.append("  description: ").append(quote(nz(p.getDescription()))).append(",\n");
+                sb.append("  argsSchema: {");
+                boolean first = true;
+                for (var arg : p.getArguments()) {
+                    if (!first) sb.append(", ");
+                    sb.append(arg.getName()).append(": z.string()");
+                    if (!arg.isRequired()) sb.append(".optional()");
+                    first = false;
+                }
+                sb.append("},\n}, async (args) => ({\n");
+                sb.append("  messages: [{ role: \"user\", content: { type: \"text\", text: `")
+                        .append(escapeBacktick(nz(p.getTemplate()))).append("` } }]\n}));\n\n");
+            }
+        }
+        return sb.toString();
+    }
+
+    private String toolFile(Tool tool) {
+        String fnName = GeneratorUtils.sanitise(tool.getName());
+        String props  = tool.getInputSchema() == null
+                ? "args: any"
+                : "args: { " + schemaParamsTs(tool.getInputSchema()) + " }";
+        return """
+                /**
+                 * %s — %s
+                 *
+                 * Side effects: %s
+                 * Implementation hint: %s
+                 */
+                export async function %sHandler(%s) {
+                  // TODO: implement the real logic. The scaffold below returns a
+                  // placeholder so the server boots and Claude can call it.
+                  return {
+                    content: [{ type: "text", text: `TODO: implement %s — received ${JSON.stringify(args)}` }],
+                  };
+                }
+                """.formatted(
+                tool.getName(), nz(tool.getDescription()),
+                nz(tool.getSideEffects()),
+                nz(tool.getImplementationHint()).replace("\n", " "),
+                fnName, props, tool.getName());
+    }
+
+    private String toolsIndex(List<Tool> tools) {
+        StringBuilder sb = new StringBuilder();
+        sb.append("// Re-export all tool handlers.\n");
+        for (Tool t : tools) {
+            String fnName = GeneratorUtils.sanitise(t.getName());
+            sb.append("export { ").append(fnName).append("Handler } from \"./").append(fnName).append(".js\";\n");
+        }
+        return sb.toString();
+    }
+
+    private String tsQuickStart(McpProject.Transport t, McpProject.Auth a) {
+        boolean stdio = t != null && "stdio".equals(t.getKind());
+        StringBuilder sb = new StringBuilder("\n## Run locally\n\n```bash\nnpm install\nnpm run build\n");
+        if (a != null && "bearer".equalsIgnoreCase(a.getKind())) {
+            sb.append("export MCP_AUTH_TOKEN=").append(a.getGeneratedToken() == null ? "<your-token>" : a.getGeneratedToken()).append("\n");
+        }
+        sb.append(stdio ? "npm start   # launches over stdio\n" : "npm start   # listens on http://localhost:3500/mcp\n");
+        sb.append("```\n");
+        return sb.toString();
+    }
+
+    // --------------------- helpers ---------------------
+
+    private GeneratedFile file(String path, String content, String hint) {
+        byte[] bytes = content.getBytes();
+        return GeneratedFile.builder().path(path).content(content).bytes(bytes.length).mimeHint(hint).build();
+    }
+
+    private static String quote(String s) { return "\"" + (s == null ? "" : s.replace("\\","\\\\").replace("\"","\\\"")) + "\""; }
+    private static String nz(String s)   { return s == null ? "" : s; }
+    private static String escapeBacktick(String s) { return s == null ? "" : s.replace("`","\\`").replace("$","\\$"); }
+
+    @SuppressWarnings("unchecked")
+    private static String zodShapeFromSchema(Map<String, Object> schema) {
+        if (schema == null) return "{}";
+        Object props = schema.get("properties");
+        if (!(props instanceof Map<?, ?> map)) return "{}";
+        List<String> required = schema.get("required") instanceof List<?> l ? l.stream().map(Object::toString).toList() : List.of();
+        StringBuilder sb = new StringBuilder("{ ");
+        int i = 0;
+        for (var e : map.entrySet()) {
+            String k = e.getKey().toString();
+            Map<String, Object> v = e.getValue() instanceof Map ? (Map<String, Object>) e.getValue() : Map.of();
+            if (i++ > 0) sb.append(", ");
+            sb.append(k).append(": ").append(zodFromProp(v));
+            if (!required.contains(k)) sb.append(".optional()");
+        }
+        sb.append(" }");
+        return sb.toString();
+    }
+
+    @SuppressWarnings("unchecked")
+    private static String schemaParamsTs(Map<String, Object> schema) {
+        Object props = schema.get("properties");
+        if (!(props instanceof Map<?, ?> map) || map.isEmpty()) return "[key: string]: any";
+        List<String> required = schema.get("required") instanceof List<?> l ? l.stream().map(Object::toString).toList() : List.of();
+        StringBuilder sb = new StringBuilder();
+        int i = 0;
+        for (var e : map.entrySet()) {
+            String k = e.getKey().toString();
+            Map<String, Object> v = e.getValue() instanceof Map ? (Map<String, Object>) e.getValue() : Map.of();
+            if (i++ > 0) sb.append("; ");
+            sb.append(k);
+            if (!required.contains(k)) sb.append("?");
+            sb.append(": ").append(tsTypeFromProp(v));
+        }
+        return sb.toString();
+    }
+
+    private static String zodFromProp(Map<String, Object> v) {
+        String t = v.get("type") == null ? "string" : v.get("type").toString();
+        return switch (t) {
+            case "number", "integer" -> "z.number()";
+            case "boolean" -> "z.boolean()";
+            case "array"   -> "z.array(z.any())";
+            case "object"  -> "z.record(z.any())";
+            default        -> "z.string()";
+        };
+    }
+
+    private static String tsTypeFromProp(Map<String, Object> v) {
+        String t = v.get("type") == null ? "string" : v.get("type").toString();
+        return switch (t) {
+            case "number", "integer" -> "number";
+            case "boolean" -> "boolean";
+            case "array"   -> "any[]";
+            case "object"  -> "Record<string, any>";
+            default        -> "string";
+        };
+    }
+}

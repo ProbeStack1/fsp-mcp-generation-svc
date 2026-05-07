@@ -1,0 +1,234 @@
+package com.forgesphere.mcpgen.model;
+
+import lombok.AllArgsConstructor;
+import lombok.Builder;
+import lombok.Data;
+import lombok.NoArgsConstructor;
+import org.springframework.data.annotation.Id;
+import org.springframework.data.mongodb.core.index.Indexed;
+import org.springframework.data.mongodb.core.mapping.Document;
+
+import java.time.Instant;
+import java.util.List;
+import java.util.Map;
+
+/**
+ * An MCP-generation project = one run of the wizard, persisted across
+ * steps so the user can come back and edit. The whole wizard state lives
+ * inside a single document to keep the API simple.
+ *
+ * Only `identity` and `capabilities` are the *actual* MCP spec — the
+ * rest are runtime / transport / auth knobs that shape the generated
+ * code. `generated` is populated after the first `POST /generate` call.
+ */
+@Data
+@Builder
+@NoArgsConstructor
+@AllArgsConstructor
+@Document(collection = "mcp_projects")
+public class McpProject {
+
+    @Id
+    private String id;                    // generated UUID
+
+    @Indexed private String ownerEmail;   // free-form identifier supplied by caller
+    @Indexed private String workspaceId;  // free-form identifier supplied by caller
+
+    /**
+     * Reference to the upstream `onboard_context._id`. Same field
+     * microservice ({@code forgeq-microservice-mgmt-svc}) uses to link
+     * its docs back to an Application onboarding.
+     */
+    @Indexed private String onboardingId;
+
+    /**
+     * Reference to the upstream `connector._id` chosen via senior's
+     * `ConnectorModal` (sourceCodeManagement / cloudProvider /
+     * databaseConnector are stored upstream — we just hold the pointer).
+     */
+    @Indexed private String connectorId;
+
+    /**
+     * Denormalised snapshot of the onboarding context — kept in sync at
+     * write time so dashboards don't need a join with onboard_context.
+     * Same pattern as microservice docs.
+     */
+    private Onboarding onboarding;
+
+    /**
+     * Provenance: 'blank' or the starter-template id the user picked
+     * (e.g. 'github-issues', 'postgres-readonly'). Surfaces in dashboards
+     * so we can answer "what % of MCP servers came from templates?"
+     */
+    @Indexed private String source;
+
+    /**
+     * Pointer to the persisted ZIP in object storage (set after first
+     * download). Allows users to re-download from any device without
+     * regenerating.
+     */
+    private String  zipObjectPath;
+    private Long    zipBytes;
+    private String  zipContentType;
+    private Instant zipUploadedAt;
+
+    private Identity    identity;
+    private Capabilities capabilities;
+    private Runtime     runtime;
+    private Transport   transport;
+    private Auth        auth;
+    private Advanced    advanced;
+
+    private Generated   generated;        // null until `generate` is called
+
+    @Indexed private Instant createdAt;
+    private Instant updatedAt;
+    private Instant lastDownloadedAt;     // set when the zip is fetched
+
+    // ---------------- nested types ----------------
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Onboarding {
+        private String organizationId;
+        private String businessUnit;
+        private String teamName;
+        private String applicationName;
+        private String applicationId;
+        private String projectOwner;
+        private String ownerEmail;
+        private String projectSME;
+        private String projectSMEEmail;
+        private String projectDLEmail;
+        private String expectedGoLiveDate;    // ISO date string from <input type=date>
+        private String goLiveDate;
+        private String testerName;
+        private String testerEmail;
+        private String serviceNowGroupName;
+        private String serviceNowGroup;
+        private String serviceNowEmail;
+        @Builder.Default private List<String> consumerIds = List.of();
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Identity {
+        private String displayName;
+        private String slug;
+        private String summary;
+        private String description;
+        private String category;      // AI, Code, Database, Productivity, DevOps …
+        private String emoji;
+        private String license;       // MIT, Apache-2.0, BSD-3, Proprietary
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Capabilities {
+        @Builder.Default private List<Tool>     tools     = List.of();
+        @Builder.Default private List<Resource> resources = List.of();
+        @Builder.Default private List<Prompt>   prompts   = List.of();
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Tool {
+        private String name;                  // snake_case
+        private String description;
+        private Map<String, Object> inputSchema;   // JSON Schema
+        private String outputType;            // structured-json | text | markdown | image
+        private String sideEffects;           // read-only | writes | destructive
+        private String implementationHint;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Resource {
+        private String uriTemplate;           // e.g. "repo://{owner}/{name}/issues"
+        private String name;
+        private String description;
+        private String mimeType;              // application/json, text/plain, …
+        private String mode;                  // static | dynamic
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Prompt {
+        private String name;                  // snake_case
+        private String description;
+        @Builder.Default private List<PromptArg> arguments = List.of();
+        private String template;              // markdown body with {{placeholders}}
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class PromptArg {
+        private String name;
+        private String description;
+        private boolean required;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Runtime {
+        private String language;        // typescript | python | java | raw
+        private String languageVersion; // e.g. node20, py3.12, java17
+        private String sdkVersion;      // e.g. "^1.0.0"
+        private String bundler;         // TS: tsx | tsup | esbuild
+        private String runner;          // py: python | uv | docker
+        private String buildTool;       // java: maven | gradle
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Transport {
+        private String kind;            // stdio | streamable-http | http-sse
+        private String baseUrl;         // only when kind != stdio
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Auth {
+        private String kind;            // none | bearer | api-key | oauth | custom
+        private String headerName;      // e.g. "Authorization"
+        private String generatedToken;  // only when kind == bearer (random hex)
+        private OAuthConfig oauth;      // only when kind == oauth
+        private String customMiddleware;// only when kind == custom
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class OAuthConfig {
+        private String issuerUrl;
+        private String clientId;
+        private String audience;
+        @Builder.Default private List<String> scopes = List.of();
+    }
+
+    /**
+     * Production-hardening knobs. All optional — the generator uses sane
+     * defaults if this whole section is null.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Advanced {
+        @Builder.Default private RateLimit   rateLimit    = RateLimit.builder().enabled(false).requestsPerMinute(60).build();
+        @Builder.Default private Cors        cors         = Cors.builder().enabled(true).allowedOrigins("*").build();
+        @Builder.Default private FlagPath    logging      = FlagPath.builder().enabled(true).build();
+        @Builder.Default private FlagPath    healthCheck  = FlagPath.builder().enabled(true).path("/healthz").build();
+        @Builder.Default private FlagPath    metrics      = FlagPath.builder().enabled(false).path("/metrics").build();
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class RateLimit { private boolean enabled; private int requestsPerMinute; }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Cors { private boolean enabled; private String allowedOrigins; }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class FlagPath { private boolean enabled; private String path; }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class Generated {
+        @Builder.Default private List<GeneratedFile> files = List.of();
+        private int totalBytes;
+        private Instant generatedAt;
+        private String checksum;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class GeneratedFile {
+        private String path;            // e.g. "src/tools/get_issue.ts"
+        private String content;         // UTF-8
+        private int bytes;
+        private String mimeHint;        // for syntax highlighting on the FE
+    }
+}

@@ -1,0 +1,31 @@
+# This file ships verbatim into every generated MCP zip at
+# `.github/workflows/mcp.yml`. Until you paste real content the
+# workflow file is OMITTED from the zip — better to ship no
+# workflow than a broken stub.
+#
+# Three OPTIONAL placeholders are substituted at generation time. Use
+# them if you want runtime-aware behaviour, otherwise just paste plain
+# YAML and ignore them entirely:
+#
+#   ${slug}        → the Step-2 slug, e.g. weather-pro-mcp
+#   ${language}    → typescript | python | java | raw
+#   ${langSteps}   → ready-made GitHub-Actions setup + test steps for
+#                    the chosen runtime (setup-node + npm test for TS,
+#                    setup-python + pytest for Python, setup-java +
+#                    mvn for Java, jq validation for raw). Drop this
+#                    placeholder where you want runtime-specific build
+#                    steps inserted.
+#
+# Example skeleton (delete these comment lines + paste real content):
+# ----------------------------------------------------------------
+# name: build-and-deploy-${slug}
+# on: { push: { branches: [main] } }
+# jobs:
+#   build:
+#     runs-on: ubuntu-latest
+#     steps:
+#       - uses: actions/checkout@v4
+# ${langSteps}
+#       - name: Push & deploy
+#         run: echo "your real pipeline body here"
+# ----------------------------------------------------------------
