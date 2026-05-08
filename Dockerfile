@@ -30,6 +30,7 @@ RUN addgroup -S spring && adduser -S spring -G spring
  
 # Copy the built JAR from builder stage (as root, before switching user)
 COPY --from=builder /app/target/fsp-mcp-*.jar app.jar
+
  
 # Change ownership to spring user
 RUN chown spring:spring app.jar
