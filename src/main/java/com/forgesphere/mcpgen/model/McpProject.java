@@ -42,7 +42,7 @@ public class McpProject {
     @Indexed private String onboardingId;
 
     /**
-     * Reference to the upstream `connector._id` chosen via senior's
+     * Reference to the upstream `connector._id` chosen via 
      * `ConnectorModal` (sourceCodeManagement / cloudProvider /
      * databaseConnector are stored upstream — we just hold the pointer).
      */
@@ -84,6 +84,39 @@ public class McpProject {
     @Indexed private Instant createdAt;
     private Instant updatedAt;
     private Instant lastDownloadedAt;     // set when the zip is fetched
+
+    /** "private" (default — only the creator sees this in the MCP Test Studio
+     *  "My MCPs" filter) or "public" (every workspace user sees it). Auto-derived
+     *  from auth selection: `auth.kind == 'none'` ⇒ public, else private. */
+    private String visibility;
+
+    /**
+     * Deploy bridge state — populated by `POST /projects/{id}/deploy-to-github`.
+     * The deploy endpoint mirrors our generated zip into the team's
+     * shared `microservice` / `deployment_artifacts` / `codegen_results`
+     * collections and then forwards to the existing api-development push pipeline.
+     * The zip itself lives in GCS at `gcsArchivePath` (relative to the
+     * shared bucket) — Mongo only stores the pointer.
+     */
+    @Indexed private String microserviceMirrorId;   // _id of mirrored doc in `microservice`
+    private String  deploymentArtifactId;           // _id of mirrored doc in `deployment_artifacts`
+    private String  codeGenResultId;                // _id of mirrored doc in `codegen_results`
+    private String  gcsArchivePath;                 // gs object key under shared bucket
+    private Instant mirroredAt;                     // last successful mirror write
+
+    private String  pushedRepoFullName;             // e.g. "ForgeCrux/offer-subscription-sf"
+    private String  pushedRepoUrl;
+    private String  pushedBranch;
+    private String  pushedCommitSha;
+    private String  pushedActionsUrl;
+    private Integer pushedFileCount;
+    private Instant pushedAt;
+
+    private String  latestRunId;                    // GitHub Actions run id
+    private String  latestRunStatus;                // queued|in_progress|completed
+    private String  latestRunConclusion;            // success|failure|cancelled|null
+    private String  latestRunUrl;
+    private Instant latestRunCheckedAt;
 
     // ---------------- nested types ----------------
 

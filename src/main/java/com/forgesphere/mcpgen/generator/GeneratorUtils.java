@@ -160,17 +160,19 @@ public final class GeneratorUtils {
      * comments / whitespace — that's the signal to OMIT the workflow
      * file from the zip rather than ship a broken stub.
      *
-     * Senior dev: paste the real workflow body into the template file.
+     * dev: paste the real workflow body into the template file.
      * Three placeholders are available (all optional):
      *   ${slug}        → e.g. weather-pro-mcp
      *   ${language}    → typescript | python | java | raw
      *   ${langSteps}   → per-language GitHub Actions setup + test steps
+     *   ${connectorId} → the onboarding connector id (empty when unset)
      */
     public static String buildGithubWorkflow(McpProject p) {
         String slug = p.getIdentity() != null && p.getIdentity().getSlug() != null && !p.getIdentity().getSlug().isBlank()
                 ? p.getIdentity().getSlug() : "mcp-server";
         String lang = p.getRuntime() != null && p.getRuntime().getLanguage() != null
                 ? p.getRuntime().getLanguage() : "typescript";
+        String connectorId = p.getConnectorId() != null ? p.getConnectorId() : "";
 
         String tmpl = readTemplate("/templates/github-workflows/mcp.yml.template");
         if (tmpl == null) return null;
@@ -183,9 +185,10 @@ public final class GeneratorUtils {
         if (!hasRealContent) return null;
 
         return tmpl
-                .replace("${slug}",     slug)
-                .replace("${language}", lang)
-                .replace("${langSteps}", buildLanguageSteps(lang));
+                .replace("${slug}",        slug)
+                .replace("${language}",    lang)
+                .replace("${langSteps}",   buildLanguageSteps(lang))
+                .replace("${connectorId}", connectorId);
     }
 
     /** Best-effort classpath read; returns {@code null} on any error. */

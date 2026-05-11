@@ -4,6 +4,7 @@ import com.forgesphere.mcpgen.dto.Dtos.*;
 import com.forgesphere.mcpgen.model.McpProject;
 import com.forgesphere.mcpgen.service.McpGenerationService;
 import com.forgesphere.mcpgen.service.McpProbeService;
+import com.forgesphere.mcpgen.service.MicroserviceBridgeService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
@@ -49,6 +50,7 @@ public class McpProjectController {
 
     private final McpGenerationService svc;
     private final McpProbeService probeSvc;
+    private final MicroserviceBridgeService bridgeSvc;
 
     // ------------- CRUD -------------
     @PostMapping
@@ -137,6 +139,22 @@ public class McpProjectController {
                 .header(HttpHeaders.CONTENT_DISPOSITION, "attachment; filename=\"" + slug + ".zip\"")
                 .contentType(MediaType.parseMediaType("application/zip"))
                 .body(body);
+    }
+
+    // ------------- Deploy bridge -------------
+    /**
+     * Mirror the generated project into the shared `microservice` +
+     * `deployment_artifacts` + `codegen_results` collections (and uploads
+     * the zip to the shared GCS bucket). After this call the existing
+     * `apiDevelopmentService.uploadToGitHub(microserviceId)` endpoint can
+     * pick up our artifact transparently.
+     *
+     * Returns `{ microserviceId, deploymentArtifactId, codeGenResultId, gcsBucket, gcsArchivePath, fileCount }`.
+     */
+    @PostMapping("/{id}/deploy-to-github")
+    public Envelope<Map<String, Object>> deployToGithub(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        return Envelope.ok(bridgeSvc.mirror(p));
     }
 
     // ------------- Client configs -------------

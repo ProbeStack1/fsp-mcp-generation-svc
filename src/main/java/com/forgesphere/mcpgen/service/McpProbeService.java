@@ -34,7 +34,7 @@ public class McpProbeService {
 
     // ---------------------------------------------------------- Probe
     public ProbeResponse probe(ProbeRequest req) {
-        if (req.mock()) return mockProbe();
+        if (req.mock()) return mockProbe(req);
         if (req.url() == null || req.url().isBlank())
             return new ProbeResponse(false, 0, "url is required", null, null, null, null, false);
         if (req.url().contains("localhost") || req.url().contains("127.0.0.1")) {
@@ -86,7 +86,7 @@ public class McpProbeService {
                     "jsonrpc", "2.0", "id", 3, "method", "tools/call",
                     "params", Map.of("name", req.toolName(),
                             "arguments", req.arguments() == null ? Map.of() : req.arguments()));
-            ProbeRequest asProbe = new ProbeRequest(req.url(), req.transport(), req.authHeader(), false);
+            ProbeRequest asProbe = new ProbeRequest(req.url(), req.transport(), req.authHeader(), false, null, null);
             Map<?, ?> res = callRpc(asProbe, body);
             long ms = System.currentTimeMillis() - start;
             Object content = res == null ? null : ((Map<?, ?>) res).get("result");
@@ -145,23 +145,64 @@ public class McpProbeService {
     }
 
     // -------------------------------------------------- mocks
-    private ProbeResponse mockProbe() {
-        return new ProbeResponse(true, 120, null,
-                Map.of("name", "mock-mcp-server", "version", "0.1.0", "protocolVersion", "2024-11-05"),
-                List.of(
-                        Map.of("name", "get_item", "description", "Fetch a sample item", "inputSchema",
-                                Map.of("type", "object",
-                                        "properties", Map.of("id", Map.of("type", "string")),
-                                        "required", List.of("id"))),
-                        Map.of("name", "list_items", "description", "List sample items", "inputSchema",
-                                Map.of("type", "object", "properties", Map.of()))),
-                List.of(), List.of(), true);
+    private ProbeResponse mockProbe(ProbeRequest req) {
+        // Prefer the tools the caller authored — that's the whole reason
+        // the wizard sends them along. Fall back to a stable two-tool
+        // sample only when the user hasn't built any tools yet.
+        List<Map<String, Object>> toolsOut;
+        if (req != null && req.tools() != null && !req.tools().isEmpty()) {
+            toolsOut = new ArrayList<>(req.tools().size());
+            for (Map<String, Object> t : req.tools()) {
+                Map<String, Object> shaped = new LinkedHashMap<>();
+                shaped.put("name",        t.get("name"));
+                shaped.put("description", t.getOrDefault("description", ""));
+                Object schema = t.get("inputSchema");
+                shaped.put("inputSchema", schema != null ? schema
+                        : Map.of("type", "object", "properties", Map.of()));
+                toolsOut.add(shaped);
+            }
+        } else {
+            toolsOut = List.of(
+                    Map.of("name", "get_item", "description", "Fetch a sample item", "inputSchema",
+                            Map.of("type", "object",
+                                    "properties", Map.of("id", Map.of("type", "string")),
+                                    "required", List.of("id"))),
+                    Map.of("name", "list_items", "description", "List sample items", "inputSchema",
+                            Map.of("type", "object", "properties", Map.of())));
+        }
+        Map<String, Object> serverInfo;
+        if (req != null && req.serverInfo() != null && !req.serverInfo().isEmpty()) {
+            serverInfo = req.serverInfo();
+        } else {
+            serverInfo = Map.of("name", "mock-mcp-server", "version", "0.1.0", "protocolVersion", "2024-11-05");
+        }
+        return new ProbeResponse(true, 120, null, serverInfo, toolsOut, List.of(), List.of(), true);
     }
 
     private CallResponse mockCall(CallRequest req) {
-        return new CallResponse(true, 80, null,
-                Map.of("content", List.of(Map.of("type", "text",
-                        "text", "MOCK result for " + req.toolName() + " with args " + (req.arguments() == null ? "{}" : req.arguments())))),
-                true);
+        String outputType = null;
+        if (req.toolSpec() != null && req.toolSpec().get("outputType") instanceof String s) {
+            outputType = s;
+        }
+        Object content;
+        if ("structured-json".equalsIgnoreCase(outputType)) {
+            content = Map.of("content", List.of(Map.of(
+                    "type", "json",
+                    "json", Map.of(
+                            "tool", req.toolName(),
+                            "arguments", req.arguments() == null ? Map.of() : req.arguments(),
+                            "_mock", true))));
+        } else if ("markdown".equalsIgnoreCase(outputType)) {
+            content = Map.of("content", List.of(Map.of(
+                    "type", "text",
+                    "text", "**MOCK** result for `" + req.toolName() + "`\n\nargs: `" +
+                            (req.arguments() == null ? "{}" : req.arguments()) + "`")));
+        } else {
+            content = Map.of("content", List.of(Map.of(
+                    "type", "text",
+                    "text", "MOCK result for " + req.toolName() + " with args " +
+                            (req.arguments() == null ? "{}" : req.arguments()))));
+        }
+        return new CallResponse(true, 80, null, content, true);
     }
 }

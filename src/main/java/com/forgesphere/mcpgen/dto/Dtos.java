@@ -38,7 +38,15 @@ public final class Dtos {
             String url,                 // e.g. "https://my-server.com/mcp"
             String transport,           // "streamable-http" | "http-sse" | "stdio"
             String authHeader,          // optional "Bearer xxx"
-            boolean mock) {}            // true → skip network, return a plausible mock
+            boolean mock,               // true → skip network, return a plausible mock
+            /** Optional. When `mock=true`, the service echoes back these
+             *  exact tools so the wizard's Build & Test step reflects the
+             *  tools the user actually authored. Each entry mirrors the
+             *  shape a real MCP server advertises on `tools/list`:
+             *  `{ name, description, inputSchema, outputType? }`. */
+            List<Map<String, Object>> tools,
+            /** Optional override for the mock `serverInfo` block. */
+            Map<String, Object> serverInfo) {}
 
     public record ProbeResponse(
             boolean ok, long ms, String error,
@@ -52,7 +60,11 @@ public final class Dtos {
     public record CallRequest(
             String url, String transport, String authHeader,
             String toolName, Map<String, Object> arguments,
-            boolean mock) {}
+            boolean mock,
+            /** Optional. When `mock=true`, the mock response shape is
+             *  derived from the tool spec so the user sees a result
+             *  matching the tool they authored. */
+            Map<String, Object> toolSpec) {}
 
     public record CallResponse(
             boolean ok, long ms, String error,

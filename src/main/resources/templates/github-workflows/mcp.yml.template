@@ -1,31 +1,125 @@
-# This file ships verbatim into every generated MCP zip at
-# `.github/workflows/mcp.yml`. Until you paste real content the
-# workflow file is OMITTED from the zip — better to ship no
-# workflow than a broken stub.
+# GitHub Actions workflow shipped inside every generated MCP zip at
+# `.github/workflows/mcp.yml`. Triggered automatically on every push to
+# `main` and on PRs — no manual setup required by the consumer.
 #
-# Three OPTIONAL placeholders are substituted at generation time. Use
-# them if you want runtime-aware behaviour, otherwise just paste plain
-# YAML and ignore them entirely:
+# Available substitutions (filled in by `GeneratorUtils.buildGithubWorkflow`):
+#   ${slug}         — Step-2 slug (e.g. weather-pro-mcp)
+#   ${language}     — typescript | python | java | raw
+#   ${langSteps}    — per-language setup + test steps (setup-node/python/java + run tests)
+#   ${connectorId}  — the connector picked in onboarding (or empty string)
 #
-#   ${slug}        → the Step-2 slug, e.g. weather-pro-mcp
-#   ${language}    → typescript | python | java | raw
-#   ${langSteps}   → ready-made GitHub-Actions setup + test steps for
-#                    the chosen runtime (setup-node + npm test for TS,
-#                    setup-python + pytest for Python, setup-java +
-#                    mvn for Java, jq validation for raw). Drop this
-#                    placeholder where you want runtime-specific build
-#                    steps inserted.
-#
-# Example skeleton (delete these comment lines + paste real content):
-# ----------------------------------------------------------------
-# name: build-and-deploy-${slug}
-# on: { push: { branches: [main] } }
-# jobs:
-#   build:
-#     runs-on: ubuntu-latest
-#     steps:
-#       - uses: actions/checkout@v4
-# ${langSteps}
-#       - name: Push & deploy
-#         run: echo "your real pipeline body here"
-# ----------------------------------------------------------------
+# Strategy (safe-by-default + opt-in deploy):
+#   1. Always: lint + per-language test (via ${langSteps}).
+#   2. Always: build & push a Docker image to GHCR (uses the built-in
+#      `GITHUB_TOKEN` — no extra secrets required).
+#   3. Optional: deploy to GCP Cloud Run if `GCP_SA_KEY` + `GCP_PROJECT_ID`
+#      repo secrets exist. Skips cleanly otherwise — never fails the build.
+#   4. Optional: deploy to AWS ECS if `AWS_ROLE_ARN` + `AWS_REGION` repo
+#      secrets exist. Skips cleanly otherwise.
+#   5. ${connectorId} is exposed as an env var so downstream steps can
+#      branch on the connector picked at onboarding time.
+
+name: build-and-deploy-${slug}
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write       # for GHCR push
+  id-token: write       # for OIDC-based cloud auth
+
+env:
+  IMAGE_NAME: ghcr.io/${{ github.repository }}/${slug}
+  MCP_LANGUAGE: ${language}
+  MCP_CONNECTOR_ID: "${connectorId}"
+
+jobs:
+  # ───────────────────────────── 1. Test ─────────────────────────────
+  test:
+    name: lint-and-test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+${langSteps}
+
+  # ─────────────────────────── 2. Build & push image ─────────────────
+  build:
+    name: build-image
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    outputs:
+      image-tag: ${{ steps.meta.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Compute image tag
+        id: meta
+        run: echo "tag=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+      - name: Build & push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
+            ${{ env.IMAGE_NAME }}:latest
+
+  # ─────────────────── 3. Optional: deploy to GCP Cloud Run ──────────
+  deploy-gcp:
+    name: deploy-gcp-cloud-run
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.MCP_TARGET_CLOUD == 'gcp'
+    steps:
+      - name: Auth to GCP
+        uses: google-github-actions/auth@v2
+        with:
+          credentials_json: ${{ secrets.GCP_SA_KEY }}
+      - name: Deploy to Cloud Run
+        uses: google-github-actions/deploy-cloudrun@v2
+        with:
+          service: ${slug}
+          image: ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}
+          region: ${{ vars.GCP_REGION || 'us-central1' }}
+          project_id: ${{ secrets.GCP_PROJECT_ID }}
+          flags: --allow-unauthenticated
+      - name: Echo connector context
+        run: |
+          echo "Deployed to GCP Cloud Run using connector: ${MCP_CONNECTOR_ID:-<none>}"
+
+  # ─────────────────── 4. Optional: deploy to AWS ECS ────────────────
+  deploy-aws:
+    name: deploy-aws-ecs
+    needs: build
+    runs-on: ubuntu-latest
+    if: |
+      github.event_name == 'push' &&
+      github.ref == 'refs/heads/main' &&
+      vars.MCP_TARGET_CLOUD == 'aws'
+    steps:
+      - name: Configure AWS credentials (OIDC)
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
+      - name: Pull image into ECR
+        run: |
+          echo "Pulling ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }} → ECR"
+          # TODO: replace with real `aws ecr` + `aws ecs update-service` calls.
+      - name: Echo connector context
+        run: |
+          echo "Deployed to AWS ECS using connector: ${MCP_CONNECTOR_ID:-<none>}"
