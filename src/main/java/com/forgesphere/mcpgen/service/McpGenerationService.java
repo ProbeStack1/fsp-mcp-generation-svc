@@ -98,6 +98,15 @@ public class McpGenerationService {
         int total = files.stream().mapToInt(f -> f.getBytes()).sum();
         p.setGenerated(Generated.builder()
                 .files(files).totalBytes(total).generatedAt(Instant.now()).build());
+        // Invalidate any cached zip — the in-memory files have just
+        // changed and the previously-uploaded archive (if any) is now
+        // stale. Leaving it pointed at the old object meant downloads
+        // kept handing the user yesterday's bytes even after a
+        // backend code change or a "Generate again" click.
+        p.setZipObjectPath(null);
+        p.setZipBytes(null);
+        p.setZipContentType(null);
+        p.setZipUploadedAt(null);
         p.setUpdatedAt(Instant.now());
         if (p.getId() != null && repo.existsById(p.getId())) repo.save(p);
         return p;

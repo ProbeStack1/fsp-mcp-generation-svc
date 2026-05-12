@@ -51,7 +51,13 @@ public class TypeScriptGenerator implements CodeGenerator {
         Map<String, String> deps = new LinkedHashMap<>();
         deps.put("@modelcontextprotocol/sdk", sdkVersion);
         deps.put("zod", "^3.23.8");
-        if (t != null && !"stdio".equals(t.getKind())) deps.put("express", "^4.19.2");
+        if (t != null && !"stdio".equals(t.getKind())) {
+            deps.put("express", "^4.19.2");
+            // dotenv is what bridges the .env file → process.env at runtime.
+            // Without it, MCP_AUTH_TOKEN never gets read on `npm run dev`
+            // and the auth middleware rejects every request with 401.
+            deps.put("dotenv", "^16.4.5");
+        }
         pkg.put("dependencies", deps);
         Map<String, String> devDeps = new LinkedHashMap<>();
         devDeps.put("typescript", "^5.4.0");
@@ -100,6 +106,15 @@ public class TypeScriptGenerator implements CodeGenerator {
         // ---- .env.example ----
         files.add(file(".env.example", GeneratorUtils.envExample(spec), "dotenv"));
 
+        // ---- .env (ready-to-use copy, only when bearer auth is on so
+        //      `npm run dev` works WITHOUT the user copying the example
+        //      and pasting tokens manually — eliminates the most common
+        //      "401 Unauthorized on local probe" support issue) ----
+        String envReady = GeneratorUtils.envReady(spec);
+        if (envReady != null) {
+            files.add(file(".env", envReady, "dotenv"));
+        }
+
         // ---- Dockerfile ----
         files.add(file("Dockerfile", GeneratorUtils.dockerfile(spec), "docker"));
 
@@ -138,7 +153,7 @@ public class TypeScriptGenerator implements CodeGenerator {
         }
 
 
-        // Senior dev's pipeline picks this workflow up — pushes the
+        //  dev's pipeline picks this workflow up — pushes the
         // image to the registry and rolls out a deploy. Same shape
         // across all languages.
         files.add(GeneratedFile.builder()
@@ -162,10 +177,12 @@ public class TypeScriptGenerator implements CodeGenerator {
         if ("stdio".equals(kind)) {
             return """
                     import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-                    import { server } from "./server.js";
+                    import { createServer } from "./server.js";
 
                     // STDIO transport — LLM clients (Claude Desktop, Cursor) launch this
-                    // process and talk to it over stdin/stdout.
+                    // process and talk to it over stdin/stdout. Stdio is single-session
+                    // by definition, so one `McpServer` instance is enough here.
+                    const server = createServer();
                     const transport = new StdioServerTransport();
                     await server.connect(transport);
                     """;
@@ -184,9 +201,16 @@ public class TypeScriptGenerator implements CodeGenerator {
 
         StringBuilder sb = new StringBuilder();
         sb.append("""
+                // Load .env BEFORE anything else so `process.env.MCP_AUTH_TOKEN`
+                // is populated when the auth middleware runs. Without this
+                // import, every request fails with 401 even though the token
+                // file is right next to package.json.
+                import "dotenv/config";
                 import express from "express";
+                import { randomUUID } from "node:crypto";
                 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
-                import { server } from "./server.js";
+                import { isInitializeRequest } from "@modelcontextprotocol/sdk/types.js";
+                import { createServer } from "./server.js";
 
                 const app = express();
                 app.use(express.json());
@@ -207,13 +231,20 @@ public class TypeScriptGenerator implements CodeGenerator {
         if (corsOn) sb.append("""
 
                 // CORS.
+                //
+                // `Mcp-Session-Id` is critical to expose — without it the
+                // browser refuses to let the JS client read the header,
+                // so the client can never learn its session id and the
+                // *second* JSON-RPC call (`tools/list`) bombs with a
+                // 400 "Mcp-Session-Id header is required" on the server.
                 const ALLOWED_ORIGINS = %s;
                 app.use((req, res, next) => {
                   const origin = req.headers.origin || "";
                   const allow = ALLOWED_ORIGINS === "*" ? "*" : (ALLOWED_ORIGINS.split(",").map((s: string) => s.trim()).includes(origin) ? origin : "");
                   if (allow) res.setHeader("Access-Control-Allow-Origin", allow);
                   res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-                  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization");
+                  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+                  res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
                   if (req.method === "OPTIONS") return res.sendStatus(204);
                   next();
                 });
@@ -264,14 +295,69 @@ public class TypeScriptGenerator implements CodeGenerator {
 
         sb.append("""
 
-                const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
-                await server.connect(transport);
+                // ---------------------------------------------------------------
+                // Per-session transport map.
+                //
+                // The MCP SDK's `Server` is single-shot: it accepts exactly one
+                // `initialize` request and then rejects any further ones with
+                // HTTP 400 "Server already initialized" (JSON-RPC -32600). The
+                // browser test client (and any well-behaved MCP client) reuses
+                // its session id across calls, but a *fresh* client (page
+                // reload, second probe click after the cache was cleared, a
+                // second tab, etc.) will send `initialize` again. To support
+                // that we keep a map of transports keyed by session id and
+                // build a brand-new `McpServer` + transport pair for every
+                // new initialize. Reusing the same `McpServer` instance for
+                // multiple sessions is what triggers the "already initialized"
+                // error — so we call `createServer()` per session.
+                // ---------------------------------------------------------------
+                const transports: Record<string, StreamableHTTPServerTransport> = {};
+
                 """);
 
-        if (hasAuth) sb.append("app.use(requireAuth);\n");
+        if (hasAuth) sb.append("app.use(\"/mcp\", requireAuth);\n");
 
         sb.append("""
-                app.all("/mcp", async (req, res) => { await transport.handleRequest(req, res, req.body); });
+                app.all("/mcp", async (req, res) => {
+                  try {
+                    const sid = (req.headers["mcp-session-id"] as string | undefined) || undefined;
+                    let transport: StreamableHTTPServerTransport | undefined =
+                      sid ? transports[sid] : undefined;
+
+                    if (!transport) {
+                      // No known session. The only call we accept without a
+                      // session is `initialize` (POST). Everything else is a
+                      // protocol violation that the SDK itself would reject
+                      // with a confusing message, so we short-circuit it here.
+                      if (req.method !== "POST" || !isInitializeRequest(req.body)) {
+                        return res.status(400).json({
+                          jsonrpc: "2.0",
+                          id: null,
+                          error: { code: -32000, message: "Bad Request: no active MCP session — send `initialize` first." },
+                        });
+                      }
+                      transport = new StreamableHTTPServerTransport({
+                        sessionIdGenerator: () => randomUUID(),
+                        onsessioninitialized: (newSid: string) => { transports[newSid] = transport!; },
+                      });
+                      transport.onclose = () => {
+                        if (transport && transport.sessionId) delete transports[transport.sessionId];
+                      };
+                      const mcp = createServer();
+                      await mcp.connect(transport);
+                    }
+                    await transport.handleRequest(req, res, req.body);
+                  } catch (err: any) {
+                    console.error("/mcp handler error", err);
+                    if (!res.headersSent) {
+                      res.status(500).json({
+                        jsonrpc: "2.0",
+                        id: null,
+                        error: { code: -32000, message: err?.message || "internal server error" },
+                      });
+                    }
+                  }
+                });
 
                 const port = Number(process.env.PORT || 3500);
                 app.listen(port, () => { console.log(`MCP server listening on http://localhost:${port}/mcp`); });
@@ -288,43 +374,63 @@ public class TypeScriptGenerator implements CodeGenerator {
                 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
                 import { z } from "zod";
 
-                export const server = new McpServer({
                 """);
-        sb.append("  name: ").append(quote(id == null ? "mcp-server" : id.getDisplayName())).append(",\n");
-        sb.append("  version: \"0.1.0\",\n");
-        sb.append("});\n\n");
 
+        // Import tool handlers at top-level (they're pure functions, safe to share across sessions).
         if (caps != null && !caps.getTools().isEmpty()) {
-            sb.append("// ---------- Tools ----------\n");
             for (Tool tool : caps.getTools()) {
                 String fnName = GeneratorUtils.sanitise(tool.getName());
                 sb.append("import { ").append(fnName).append("Handler } from \"./tools/").append(fnName).append(".js\";\n");
             }
             sb.append('\n');
+        }
+
+        // Factory: every new MCP session gets its own `McpServer` instance.
+        // The SDK's Server class is single-shot — reusing it across sessions
+        // causes "Server already initialized" on the second `initialize`.
+        sb.append("""
+                /**
+                 * Build a fresh MCP server instance.
+                 *
+                 * We export a FACTORY rather than a singleton so the HTTP
+                 * transport can hand each new session its own `McpServer`.
+                 * The MCP SDK rejects a second `initialize` on the same
+                 * Server instance, so a per-session factory is mandatory
+                 * for the streamable-http transport.
+                 */
+                export function createServer(): McpServer {
+                """);
+        sb.append("  const server = new McpServer({\n");
+        sb.append("    name: ").append(quote(id == null ? "mcp-server" : id.getDisplayName())).append(",\n");
+        sb.append("    version: \"0.1.0\",\n");
+        sb.append("  });\n\n");
+
+        if (caps != null && !caps.getTools().isEmpty()) {
+            sb.append("  // ---------- Tools ----------\n");
             for (Tool tool : caps.getTools()) {
                 String fnName = GeneratorUtils.sanitise(tool.getName());
-                sb.append("server.registerTool(").append(quote(tool.getName())).append(", {\n");
-                sb.append("  description: ").append(quote(nz(tool.getDescription()))).append(",\n");
-                sb.append("  inputSchema: ").append(zodShapeFromSchema(tool.getInputSchema())).append(",\n");
-                sb.append("}, ").append(fnName).append("Handler);\n\n");
+                sb.append("  server.registerTool(").append(quote(tool.getName())).append(", {\n");
+                sb.append("    description: ").append(quote(nz(tool.getDescription()))).append(",\n");
+                sb.append("    inputSchema: ").append(zodShapeFromSchema(tool.getInputSchema())).append(",\n");
+                sb.append("  }, ").append(fnName).append("Handler);\n\n");
             }
         }
         if (caps != null && !caps.getResources().isEmpty()) {
-            sb.append("// ---------- Resources ----------\n");
+            sb.append("  // ---------- Resources ----------\n");
             for (var r : caps.getResources()) {
-                sb.append("server.registerResource(").append(quote(r.getName())).append(", ")
+                sb.append("  server.registerResource(").append(quote(r.getName())).append(", ")
                         .append(quote(r.getUriTemplate())).append(", {\n");
-                sb.append("  description: ").append(quote(nz(r.getDescription()))).append(",\n");
-                sb.append("  mimeType: ").append(quote(nz(r.getMimeType()))).append(",\n");
-                sb.append("}, async (uri) => ({\n  contents: [{ uri: uri.href, text: \"TODO: return resource contents\" }]\n}));\n\n");
+                sb.append("    description: ").append(quote(nz(r.getDescription()))).append(",\n");
+                sb.append("    mimeType: ").append(quote(nz(r.getMimeType()))).append(",\n");
+                sb.append("  }, async (uri) => ({\n    contents: [{ uri: uri.href, text: \"TODO: return resource contents\" }]\n  }));\n\n");
             }
         }
         if (caps != null && !caps.getPrompts().isEmpty()) {
-            sb.append("// ---------- Prompts ----------\n");
+            sb.append("  // ---------- Prompts ----------\n");
             for (var p : caps.getPrompts()) {
-                sb.append("server.registerPrompt(").append(quote(p.getName())).append(", {\n");
-                sb.append("  description: ").append(quote(nz(p.getDescription()))).append(",\n");
-                sb.append("  argsSchema: {");
+                sb.append("  server.registerPrompt(").append(quote(p.getName())).append(", {\n");
+                sb.append("    description: ").append(quote(nz(p.getDescription()))).append(",\n");
+                sb.append("    argsSchema: {");
                 boolean first = true;
                 for (var arg : p.getArguments()) {
                     if (!first) sb.append(", ");
@@ -332,11 +438,13 @@ public class TypeScriptGenerator implements CodeGenerator {
                     if (!arg.isRequired()) sb.append(".optional()");
                     first = false;
                 }
-                sb.append("},\n}, async (args) => ({\n");
-                sb.append("  messages: [{ role: \"user\", content: { type: \"text\", text: `")
-                        .append(escapeBacktick(nz(p.getTemplate()))).append("` } }]\n}));\n\n");
+                sb.append("},\n  }, async (args) => ({\n");
+                sb.append("    messages: [{ role: \"user\", content: { type: \"text\", text: `")
+                        .append(escapeBacktick(nz(p.getTemplate()))).append("` } }]\n  }));\n\n");
             }
         }
+
+        sb.append("  return server;\n}\n");
         return sb.toString();
     }
 

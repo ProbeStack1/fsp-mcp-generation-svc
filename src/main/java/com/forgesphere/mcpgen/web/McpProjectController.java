@@ -157,6 +157,21 @@ public class McpProjectController {
         return Envelope.ok(bridgeSvc.mirror(p));
     }
 
+    /**
+     * Push the generated MCP code DIRECTLY to the user's GitHub repo
+     * using the token from the connector linked to this project. This
+     * is the endpoint the wizard calls on "Push & Deploy" — it solves
+     * the "repo is empty" problem caused by the  api-development
+     * team's template-repo+workflow_dispatch flow.
+     *
+     * Returns `{ repoFullName, repoUrl, branch, pushedCount, failedCount, pushedFiles, failedFiles }`.
+     */
+    @PostMapping("/{id}/push-to-github")
+    public Envelope<Map<String, Object>> pushToGithub(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        return Envelope.ok(bridgeSvc.pushToGitHub(p));
+    }
+
     // ------------- Client configs -------------
     @GetMapping("/{id}/client-configs")
     public Envelope<Map<String, Object>> configs(@PathVariable String id) {

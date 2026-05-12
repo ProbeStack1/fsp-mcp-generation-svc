@@ -184,6 +184,248 @@ public class MicroserviceBridgeService {
     }
 
     /**
+     * Push the generated MCP files DIRECTLY to the user's GitHub repo
+     * using the token stored on their saved connector. We bypass the
+     *  api-development service's "trigger workflow_dispatch"
+     * model because that model assumes a template-repo pattern owned
+     * by the  team; it doesn't work for "push to MY own repo".
+     *
+     *  - Reads `orgOrUser` / `repo` / `branch` / `token` from the
+     *    connector doc that {@code mcpProject.connectorId} (or the
+     *    bridge's connector-by-org fallback) resolves to.
+     *  - Walks {@code mcpProject.generated.files} and posts each one
+     *    via {@code PUT /repos/{owner}/{repo}/contents/{path}}.
+     *    Existing files get updated (sha is fetched first); new files
+     *    get created. This is the only GitHub API call that works for
+     *    a brand-new EMPTY repo (Git Data API requires at least one
+     *    commit to start from).
+     *  - Returns a map with the resulting repo URL + per-file results
+     *    so the UI can surface "Pushed N files to {repo}".
+     *
+     *  Best-effort: a single file failure does NOT abort the loop —
+     *  we collect errors and return them so the user can see which
+     *  files landed and which didn't. This avoids the worst-case
+     *  "partial push, repo half-empty" support story.
+     */
+    public Map<String, Object> pushToGitHub(McpProject project) {
+        McpProject p = project;
+        if (p.getGenerated() == null
+                || p.getGenerated().getFiles() == null
+                || p.getGenerated().getFiles().isEmpty()) {
+            log.info("[push] project={} has no generated files - running generator", p.getId());
+            p = genSvc.generate(p.getId());
+        }
+        final McpProject mcp = p;
+
+        // ─── Resolve connector → GitHub credentials ──────────────────
+        String connectorId = resolveConnectorId(mcp);
+        if (connectorId == null) {
+            throw new IllegalStateException(
+                "No GitHub connector found for this MCP. Open onboarding and save a connector first.");
+        }
+        org.bson.Document conn;
+        try {
+            conn = bridgeColl(props.getColl().getConnector())
+                    .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
+                    .first();
+        } catch (Exception e) {
+            throw new IllegalStateException("Couldn't load connector " + connectorId + ": " + e.getMessage(), e);
+        }
+        if (conn == null) {
+            throw new IllegalStateException("Connector " + connectorId + " not found.");
+        }
+        org.bson.Document scm = conn.get("sourceCodeManagement", org.bson.Document.class);
+        if (scm == null) {
+            throw new IllegalStateException("Connector " + connectorId + " has no sourceCodeManagement block.");
+        }
+        String token     = scm.getString("token");
+        String orgOrUser = scm.getString("orgOrUser");
+        String repo      = scm.getString("repo");
+        String branch    = scm.getString("branch");
+        if (token == null || token.isBlank()) throw new IllegalStateException("Connector has no GitHub token.");
+        if (orgOrUser == null || orgOrUser.isBlank()) throw new IllegalStateException("Connector has no orgOrUser.");
+        if (repo == null || repo.isBlank()) throw new IllegalStateException("Connector has no repo.");
+        if (branch == null || branch.isBlank()) branch = "main";
+
+        log.info("[push] target=https://github.com/{}/{} branch={} files={}",
+                orgOrUser, repo, branch, mcp.getGenerated().getFiles().size());
+
+        // ─── Make sure the repo exists ──────────────────────────────
+        // GitHub returns 404 if the repo isn't there. Create it under
+        // the user's account when missing. We can't reliably know if
+        // `orgOrUser` is a user or an org from the connector, so we
+        // try the user endpoint first and fall back to the org one on
+        // 404 — same heuristic the GitHub CLI uses.
+        ensureRepoExists(orgOrUser, repo, branch, token, scm);
+
+        // ─── Push each file via the Contents API ────────────────────
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        java.util.List<Map<String, Object>> pushedFiles = new java.util.ArrayList<>();
+        java.util.List<Map<String, Object>> failedFiles = new java.util.ArrayList<>();
+        String commitMessage = "Push from ForgeSphere MCP wizard";
+        for (var gf : mcp.getGenerated().getFiles()) {
+            String path = gf.getPath();
+            String content = gf.getContent() == null ? "" : gf.getContent();
+            try {
+                Map<String, Object> ok = putFile(http, orgOrUser, repo, branch, path, content, token, commitMessage);
+                pushedFiles.add(ok);
+            } catch (Exception e) {
+                log.warn("[push] {} → {} FAILED: {}", path, repo, e.getMessage());
+                Map<String, Object> err = new LinkedHashMap<>();
+                err.put("path", path);
+                err.put("error", e.getMessage());
+                failedFiles.add(err);
+            }
+        }
+
+        // ─── Persist push state on our McpProject doc ────────────────
+        String repoUrl = "https://github.com/" + orgOrUser + "/" + repo;
+        mcp.setPushedRepoFullName(orgOrUser + "/" + repo);
+        mcp.setPushedRepoUrl(repoUrl);
+        mcp.setPushedBranch(branch);
+        mcp.setPushedFileCount(pushedFiles.size());
+        mcp.setPushedAt(Instant.now());
+        if (mcp.getId() != null) projects.save(mcp);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("repoFullName", orgOrUser + "/" + repo);
+        out.put("repoUrl",      repoUrl);
+        out.put("branch",       branch);
+        out.put("pushedCount",  pushedFiles.size());
+        out.put("failedCount",  failedFiles.size());
+        out.put("pushedFiles",  pushedFiles);
+        out.put("failedFiles",  failedFiles);
+        log.info("[push] done project={} pushed={} failed={}",
+                mcp.getId(), pushedFiles.size(), failedFiles.size());
+        return out;
+    }
+
+    /**
+     * Create the GitHub repo if it doesn't exist yet. Empty new repos
+     * have no default branch, so we also initialise `branch` with an
+     * empty README so subsequent PUT /contents calls don't 404 on
+     * "ref not found".
+     */
+    private void ensureRepoExists(String orgOrUser, String repo, String branch, String token, org.bson.Document scm) {
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        try {
+            var get = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) return;   // repo exists — nothing to do
+            if (resp.statusCode() != 404) {
+                log.warn("[push] repo lookup non-200/404: {} {}", resp.statusCode(), resp.body());
+            }
+        } catch (Exception e) {
+            log.warn("[push] repo lookup failed (will try to create): {}", e.getMessage());
+        }
+
+        boolean isPrivate = scm.containsKey("isPrivate")
+                ? Boolean.TRUE.equals(scm.getBoolean("isPrivate")) : false;
+        // Try as a user first (POST /user/repos). If the token doesn't
+        // own that user (e.g. orgOrUser is actually an org), retry as
+        // an org (POST /orgs/{org}/repos).
+        String createBody = "{\"name\":\"" + repo + "\",\"private\":" + isPrivate + ",\"auto_init\":true}";
+        try {
+            var create = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/user/repos"))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(createBody))
+                    .build();
+            var resp = http.send(create, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 201) {
+                log.info("[push] created user repo {}/{}", orgOrUser, repo);
+                return;
+            }
+            log.info("[push] user repo create returned {}, falling back to org endpoint", resp.statusCode());
+        } catch (Exception e) {
+            log.warn("[push] user repo create failed: {}", e.getMessage());
+        }
+        try {
+            var create = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/orgs/" + orgOrUser + "/repos"))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(createBody))
+                    .build();
+            var resp = http.send(create, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 201) {
+                log.info("[push] created org repo {}/{}", orgOrUser, repo);
+                return;
+            }
+            throw new IllegalStateException("Couldn't create repo: " + resp.statusCode() + " " + resp.body());
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to create GitHub repo " + orgOrUser + "/" + repo + ": " + e.getMessage(), e);
+        }
+    }
+
+    /**
+     * Upsert a single file at `path` in the user's repo using the
+     * Contents API. Handles the case where the file already exists by
+     * fetching its current SHA and resending it on the PUT.
+     */
+    private Map<String, Object> putFile(java.net.http.HttpClient http,
+                                        String orgOrUser, String repo, String branch,
+                                        String path, String content, String token, String commitMessage)
+            throws Exception {
+        String url = "https://api.github.com/repos/" + orgOrUser + "/" + repo + "/contents/"
+                + java.net.URLEncoder.encode(path, java.nio.charset.StandardCharsets.UTF_8).replace("%2F", "/");
+
+        // 1) Try to GET the existing file to grab its sha.
+        String sha = null;
+        try {
+            var get = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create(url + "?ref=" + branch))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                int idx = resp.body().indexOf("\"sha\":\"");
+                if (idx > -1) {
+                    int start = idx + 7;
+                    int end   = resp.body().indexOf('"', start);
+                    if (end > start) sha = resp.body().substring(start, end);
+                }
+            }
+        } catch (Exception ignored) { /* treat as new file */ }
+
+        String b64 = java.util.Base64.getEncoder().encodeToString(content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        StringBuilder body = new StringBuilder("{");
+        body.append("\"message\":\"").append(escapeJson(commitMessage)).append("\",");
+        body.append("\"content\":\"").append(b64).append("\",");
+        body.append("\"branch\":\"").append(branch).append("\"");
+        if (sha != null) body.append(",\"sha\":\"").append(sha).append("\"");
+        body.append("}");
+
+        var put = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/vnd.github+json")
+                .header("Content-Type", "application/json")
+                .PUT(java.net.http.HttpRequest.BodyPublishers.ofString(body.toString()))
+                .build();
+        var resp = http.send(put, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200 && resp.statusCode() != 201) {
+            throw new IllegalStateException("GitHub PUT " + path + " returned " + resp.statusCode() + ": " + resp.body());
+        }
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("path", path);
+        out.put("updated", sha != null);
+        out.put("status", resp.statusCode());
+        return out;
+    }
+
+    private static String escapeJson(String s) {
+        return s.replace("\\", "\\\\").replace("\"", "\\\"");
+    }
+
+    /**
      * Mongo {@code _id} interop with Spring Data lookups.
      *
      *  The  api-development service writes microservice docs via
@@ -239,6 +481,39 @@ public class MicroserviceBridgeService {
             return org == null ? null : org.toString();
         } catch (Exception e) {
             log.warn("[bridge] connector lookup failed for {}: {}", connectorId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * Resolve the connectorId to stamp onto the mirrored microservice
+     * doc so the  api-development service finds the user's saved
+     * GitHub credentials instead of falling back to ForgeCrux's default
+     * repo.
+     *
+     * Preferred source is {@code mcpProject.connectorId} — what the UI
+     * sets when the user saves the ConnectorModal. When the UI couldn't
+     * capture the id (existing connectors picked from a dropdown
+     * without a Save) we fall back to looking up the newest connector
+     * doc for this organization, which is exactly how the 
+     * microservice flow resolves it implicitly.
+     */
+    private String resolveConnectorId(McpProject p) {
+        if (p.getConnectorId() != null && !p.getConnectorId().isBlank()) {
+            return p.getConnectorId();
+        }
+        String org = resolveOrganizationId(p);
+        if (org == null) return null;
+        try {
+            org.bson.Document conn = bridgeColl(props.getColl().getConnector())
+                    .find(new org.bson.Document("organizationId", org))
+                    .sort(new org.bson.Document("_id", -1))
+                    .first();
+            if (conn == null) return null;
+            Object cid = conn.get("_id");
+            return cid == null ? null : cid.toString();
+        } catch (Exception e) {
+            log.warn("[bridge] connector by-org lookup failed for {}: {}", org, e.getMessage());
             return null;
         }
     }
@@ -348,7 +623,7 @@ public class MicroserviceBridgeService {
         doc.put("serviceNowEmail",     ob == null ? null : ob.getServiceNowEmail());
         doc.put("consumerIds",         ob == null || ob.getConsumerIds() == null
                                             ? List.of() : ob.getConsumerIds());
-        doc.put("connectorId",         p.getConnectorId());
+        doc.put("connectorId",         resolveConnectorId(p));
         doc.put("mcpProjectId",        p.getId());
         doc.put("mcpSlug",             id == null ? null : id.getSlug());
         doc.put("createdAt",           now);
