@@ -199,6 +199,18 @@ public final class GeneratorUtils {
                 ? p.getRuntime().getLanguage() : "typescript";
         String connectorId = p.getConnectorId() != null ? p.getConnectorId() : "";
 
+        // Port + health path used by the deploy-to-Cloud-Run step.
+        // Defaults match what TypeScriptGenerator/PythonGenerator emit
+        // (port 3500, /healthz). Java generator already deploys on 8080.
+        String port = "3500";
+        String healthPath = "/healthz";
+        if ("java".equals(lang)) port = "8080";
+        if (p.getAdvanced() != null && p.getAdvanced().getHealthCheck() != null
+                && p.getAdvanced().getHealthCheck().getPath() != null
+                && !p.getAdvanced().getHealthCheck().getPath().isBlank()) {
+            healthPath = p.getAdvanced().getHealthCheck().getPath();
+        }
+
         String tmpl = readTemplate("/templates/github-workflows/mcp.yml.template");
         if (tmpl == null) return null;
 
@@ -213,7 +225,9 @@ public final class GeneratorUtils {
                 .replace("${slug}",        slug)
                 .replace("${language}",    lang)
                 .replace("${langSteps}",   buildLanguageSteps(lang))
-                .replace("${connectorId}", connectorId);
+                .replace("${connectorId}", connectorId)
+                .replace("${port}",        port)
+                .replace("${healthPath}",  healthPath);
     }
 
     /** Best-effort classpath read; returns {@code null} on any error. */
@@ -226,40 +240,54 @@ public final class GeneratorUtils {
         }
     }
 
-    /** Per-language test/build steps slotted into the workflow above. */
+    /** Per-language test/build steps slotted into the workflow above.
+     *  Output is indented with 6 spaces so each line sits correctly
+     *  under the `steps:` block (which is itself indented 4 spaces
+     *  beneath `jobs.<id>:`). Without this indent the substitution
+     *  produces invalid YAML — list items end up at column 0. */
     private static String buildLanguageSteps(String language) {
-        return switch (language) {
+        String body = switch (language) {
             case "python" -> """
-                      - uses: actions/setup-python@v5
-                        with:
-                          python-version: '3.11'
-                      - name: Install deps
-                        run: pip install -r requirements.txt
-                      - name: Run tests
-                        run: pytest -q || true""";
+                    - uses: actions/setup-python@v5
+                      with:
+                        python-version: '3.11'
+                    - name: Install deps
+                      run: pip install -r requirements.txt
+                    - name: Run tests
+                      run: pytest -q || true""";
             case "java" -> """
-                      - uses: actions/setup-java@v4
-                        with:
-                          distribution: 'temurin'
-                          java-version: '17'
-                          cache: maven
-                      - name: Build
-                        run: mvn -B -DskipTests package
-                      - name: Run tests
-                        run: mvn -B test || true""";
+                    - uses: actions/setup-java@v4
+                      with:
+                        distribution: 'temurin'
+                        java-version: '17'
+                        cache: maven
+                    - name: Build
+                      run: mvn -B -DskipTests package
+                    - name: Run tests
+                      run: mvn -B test || true""";
             case "raw" -> """
-                      - name: Validate manifest
-                        run: |
-                          jq . mcp.json > /dev/null && echo 'mcp.json OK'""";
+                    - name: Validate manifest
+                      run: |
+                        jq . mcp.json > /dev/null && echo 'mcp.json OK'""";
             default -> """
-                      - uses: actions/setup-node@v4
-                        with:
-                          node-version: '20'
-                          cache: npm
-                      - name: Install deps
-                        run: npm ci || npm install
-                      - name: Run tests
-                        run: npm test --silent || true""";
+                    - uses: actions/setup-node@v4
+                      with:
+                        node-version: '20'
+                        cache: npm
+                    - name: Install deps
+                      run: npm ci || npm install
+                    - name: Run tests
+                      run: npm test --silent || true""";
         };
+        // Re-indent every line with 6 spaces so the steps land directly
+        // under `    steps:` (which expects each list item at column 6).
+        StringBuilder out = new StringBuilder();
+        for (String line : body.split("\n", -1)) {
+            out.append("      ").append(line).append("\n");
+        }
+        // Trim the trailing newline so the YAML doesn't end with a blank line.
+        int len = out.length();
+        if (len > 0 && out.charAt(len - 1) == '\n') out.setLength(len - 1);
+        return out.toString();
     }
 }

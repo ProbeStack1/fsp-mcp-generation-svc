@@ -305,9 +305,23 @@ public class MicroserviceBridgeService {
      * have no default branch, so we also initialise `branch` with an
      * empty README so subsequent PUT /contents calls don't 404 on
      * "ref not found".
+     *
+     * Smart owner-resolution:
+     *   1. GET /user → find the authenticated user (token owner).
+     *   2. If `orgOrUser` == token user → POST /user/repos (creates under user).
+     *   3. Otherwise → POST /orgs/{orgOrUser}/repos (creates under the org).
+     *   4. After auto_init, GitHub returns the default branch name (usually
+     *      "main"). If the connector's saved `branch` differs, we create
+     *      that branch from the default's HEAD so subsequent file PUTs
+     *      target the correct ref.
+     *   5. Poll until the branch ref is queryable (auto_init is async).
      */
     private void ensureRepoExists(String orgOrUser, String repo, String branch, String token, org.bson.Document scm) {
         java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+
+        // ─── 1. Check if repo already exists ──────────────────────────
+        boolean repoExists = false;
+        String existingDefaultBranch = null;
         try {
             var get = java.net.http.HttpRequest.newBuilder(
                     java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo))
@@ -315,53 +329,231 @@ public class MicroserviceBridgeService {
                     .header("Accept", "application/vnd.github+json")
                     .GET().build();
             var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 200) return;   // repo exists — nothing to do
-            if (resp.statusCode() != 404) {
+            if (resp.statusCode() == 200) {
+                repoExists = true;
+                int idx = resp.body().indexOf("\"default_branch\":\"");
+                if (idx > -1) {
+                    int start = idx + 18;
+                    int end = resp.body().indexOf('"', start);
+                    if (end > start) existingDefaultBranch = resp.body().substring(start, end);
+                }
+                log.info("[push] repo {}/{} already exists (default_branch={})",
+                        orgOrUser, repo, existingDefaultBranch);
+            } else if (resp.statusCode() != 404) {
                 log.warn("[push] repo lookup non-200/404: {} {}", resp.statusCode(), resp.body());
             }
         } catch (Exception e) {
             log.warn("[push] repo lookup failed (will try to create): {}", e.getMessage());
         }
 
+        // ─── 2. If repo exists, ensure the target branch exists ───────
+        if (repoExists) {
+            ensureBranchExists(http, orgOrUser, repo, branch, existingDefaultBranch, token);
+            return;
+        }
+
+        // ─── 3. Repo doesn't exist — create it under correct owner ────
+        // Find the authenticated user so we know which create endpoint
+        // to hit. /user/repos creates under the token owner regardless
+        // of the "name" you pass, so we MUST use /orgs/{org}/repos when
+        // the target is an org.
+        String authenticatedUser = null;
+        try {
+            var who = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/user"))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(who, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                int idx = resp.body().indexOf("\"login\":\"");
+                if (idx > -1) {
+                    int start = idx + 9;
+                    int end = resp.body().indexOf('"', start);
+                    if (end > start) authenticatedUser = resp.body().substring(start, end);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[push] /user lookup failed: {}", e.getMessage());
+        }
+
         boolean isPrivate = scm.containsKey("isPrivate")
                 ? Boolean.TRUE.equals(scm.getBoolean("isPrivate")) : false;
-        // Try as a user first (POST /user/repos). If the token doesn't
-        // own that user (e.g. orgOrUser is actually an org), retry as
-        // an org (POST /orgs/{org}/repos).
-        String createBody = "{\"name\":\"" + repo + "\",\"private\":" + isPrivate + ",\"auto_init\":true}";
-        try {
-            var create = java.net.http.HttpRequest.newBuilder(
-                    java.net.URI.create("https://api.github.com/user/repos"))
-                    .header("Authorization", "Bearer " + token)
-                    .header("Accept", "application/vnd.github+json")
-                    .header("Content-Type", "application/json")
-                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(createBody))
-                    .build();
-            var resp = http.send(create, java.net.http.HttpResponse.BodyHandlers.ofString());
-            if (resp.statusCode() == 201) {
-                log.info("[push] created user repo {}/{}", orgOrUser, repo);
-                return;
+        String createBody = "{\"name\":\"" + repo + "\",\"private\":" + isPrivate
+                + ",\"auto_init\":true,\"description\":\"MCP server generated by ForgeSphere\"}";
+        boolean targetIsAuthenticatedUser = orgOrUser != null
+                && authenticatedUser != null
+                && orgOrUser.equalsIgnoreCase(authenticatedUser);
+
+        boolean created = false;
+        if (targetIsAuthenticatedUser) {
+            created = tryCreate(http, "https://api.github.com/user/repos", createBody, token, orgOrUser, repo);
+        } else {
+            // Target is an org (or different user) — must use org endpoint
+            created = tryCreate(http, "https://api.github.com/orgs/" + orgOrUser + "/repos",
+                    createBody, token, orgOrUser, repo);
+            if (!created) {
+                // Fallback: maybe it's actually a user the token can write to (collaborator scenario)
+                log.info("[push] org create failed, falling back to /user/repos");
+                created = tryCreate(http, "https://api.github.com/user/repos", createBody, token, orgOrUser, repo);
             }
-            log.info("[push] user repo create returned {}, falling back to org endpoint", resp.statusCode());
-        } catch (Exception e) {
-            log.warn("[push] user repo create failed: {}", e.getMessage());
         }
+        if (!created) {
+            throw new IllegalStateException("Couldn't create GitHub repo " + orgOrUser + "/" + repo
+                    + " (token user=" + authenticatedUser + "). Make sure the PAT has 'repo' scope"
+                    + " and (if the target is an org) 'admin:org' / org membership.");
+        }
+
+        // ─── 4. Wait for auto_init commit, then create target branch ──
+        // GitHub auto_init creates `main` (or `master` for legacy accounts).
+        // We poll for the default branch to be ready, then if the user
+        // wants a different branch, fork it off the default.
+        String newRepoDefaultBranch = waitForDefaultBranch(http, orgOrUser, repo, token);
+        if (newRepoDefaultBranch == null) {
+            // Last-resort: assume "main"
+            newRepoDefaultBranch = "main";
+        }
+        ensureBranchExists(http, orgOrUser, repo, branch, newRepoDefaultBranch, token);
+    }
+
+    private boolean tryCreate(java.net.http.HttpClient http, String url, String body,
+                              String token, String orgOrUser, String repo) {
         try {
-            var create = java.net.http.HttpRequest.newBuilder(
-                    java.net.URI.create("https://api.github.com/orgs/" + orgOrUser + "/repos"))
+            var create = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
                     .header("Authorization", "Bearer " + token)
                     .header("Accept", "application/vnd.github+json")
                     .header("Content-Type", "application/json")
-                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(createBody))
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body))
                     .build();
             var resp = http.send(create, java.net.http.HttpResponse.BodyHandlers.ofString());
             if (resp.statusCode() == 201) {
-                log.info("[push] created org repo {}/{}", orgOrUser, repo);
-                return;
+                log.info("[push] created repo {}/{} via {}", orgOrUser, repo, url);
+                return true;
             }
-            throw new IllegalStateException("Couldn't create repo: " + resp.statusCode() + " " + resp.body());
+            log.warn("[push] create via {} returned {}: {}", url, resp.statusCode(),
+                    resp.body() != null && resp.body().length() > 240 ? resp.body().substring(0, 240) : resp.body());
+            return false;
         } catch (Exception e) {
-            throw new IllegalStateException("Failed to create GitHub repo " + orgOrUser + "/" + repo + ": " + e.getMessage(), e);
+            log.warn("[push] create via {} failed: {}", url, e.getMessage());
+            return false;
+        }
+    }
+
+    /**
+     * Poll the freshly-created repo until its initial commit is queryable.
+     * GitHub's auto_init is asynchronous — file PUTs can 404 with
+     * "ref not found" for ~1-2s after the create call returns 201.
+     * Returns the default branch name once ready, or null on timeout.
+     */
+    private String waitForDefaultBranch(java.net.http.HttpClient http, String orgOrUser, String repo, String token) {
+        for (int attempt = 0; attempt < 10; attempt++) {
+            try {
+                var get = java.net.http.HttpRequest.newBuilder(
+                        java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo))
+                        .header("Authorization", "Bearer " + token)
+                        .header("Accept", "application/vnd.github+json")
+                        .GET().build();
+                var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
+                if (resp.statusCode() == 200) {
+                    int idx = resp.body().indexOf("\"default_branch\":\"");
+                    if (idx > -1) {
+                        int start = idx + 18;
+                        int end = resp.body().indexOf('"', start);
+                        if (end > start) {
+                            String defBranch = resp.body().substring(start, end);
+                            // Confirm the branch ref is queryable
+                            var refReq = java.net.http.HttpRequest.newBuilder(
+                                    java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo
+                                            + "/git/refs/heads/" + defBranch))
+                                    .header("Authorization", "Bearer " + token)
+                                    .header("Accept", "application/vnd.github+json")
+                                    .GET().build();
+                            var refResp = http.send(refReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+                            if (refResp.statusCode() == 200) {
+                                log.info("[push] default branch {} ready on {}/{} (attempt {})",
+                                        defBranch, orgOrUser, repo, attempt + 1);
+                                return defBranch;
+                            }
+                        }
+                    }
+                }
+            } catch (Exception ignored) { /* retry */ }
+            try { Thread.sleep(800); } catch (InterruptedException ie) { Thread.currentThread().interrupt(); return null; }
+        }
+        log.warn("[push] default branch not ready on {}/{} after 10 attempts", orgOrUser, repo);
+        return null;
+    }
+
+    /**
+     * Ensure the user-requested `branch` exists in the repo. If it
+     * doesn't, fork it from `sourceBranch` (usually the repo default).
+     */
+    private void ensureBranchExists(java.net.http.HttpClient http, String orgOrUser, String repo,
+                                    String branch, String sourceBranch, String token) {
+        if (branch == null || branch.isBlank()) return;
+        // Check if branch already exists
+        try {
+            var get = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo
+                            + "/git/refs/heads/" + branch))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) return; // already exists
+        } catch (Exception ignored) { /* will try to create */ }
+
+        if (sourceBranch == null || sourceBranch.equalsIgnoreCase(branch)) {
+            log.info("[push] branch {} not present and no source to fork from — file PUTs will create it",
+                    branch);
+            return;
+        }
+
+        // Get source branch's HEAD sha
+        String sourceSha = null;
+        try {
+            var get = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo
+                            + "/git/refs/heads/" + sourceBranch))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 200) {
+                int idx = resp.body().indexOf("\"sha\":\"");
+                if (idx > -1) {
+                    int start = idx + 7;
+                    int end = resp.body().indexOf('"', start);
+                    if (end > start) sourceSha = resp.body().substring(start, end);
+                }
+            }
+        } catch (Exception e) {
+            log.warn("[push] couldn't get source branch HEAD: {}", e.getMessage());
+        }
+        if (sourceSha == null) {
+            log.warn("[push] no source SHA for {} — leaving branch creation to file PUTs", sourceBranch);
+            return;
+        }
+
+        // Create the target branch
+        try {
+            String body = "{\"ref\":\"refs/heads/" + branch + "\",\"sha\":\"" + sourceSha + "\"}";
+            var create = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo + "/git/refs"))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(body))
+                    .build();
+            var resp = http.send(create, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() == 201) {
+                log.info("[push] created branch {} from {} on {}/{}",
+                        branch, sourceBranch, orgOrUser, repo);
+            } else {
+                log.warn("[push] branch create returned {}: {}", resp.statusCode(), resp.body());
+            }
+        } catch (Exception e) {
+            log.warn("[push] branch create failed: {}", e.getMessage());
         }
     }
 
@@ -374,8 +566,18 @@ public class MicroserviceBridgeService {
                                         String orgOrUser, String repo, String branch,
                                         String path, String content, String token, String commitMessage)
             throws Exception {
-        String url = "https://api.github.com/repos/" + orgOrUser + "/" + repo + "/contents/"
-                + java.net.URLEncoder.encode(path, java.nio.charset.StandardCharsets.UTF_8).replace("%2F", "/");
+        // Encode each path segment separately so '/' stays a separator
+        // but spaces and special chars become %xx (URLEncoder is for query
+        // strings — its '+' for space is invalid in path segments).
+        StringBuilder encodedPath = new StringBuilder();
+        boolean first = true;
+        for (String seg : path.split("/")) {
+            if (!first) encodedPath.append("/");
+            encodedPath.append(java.net.URLEncoder.encode(seg, java.nio.charset.StandardCharsets.UTF_8)
+                    .replace("+", "%20"));
+            first = false;
+        }
+        String url = "https://api.github.com/repos/" + orgOrUser + "/" + repo + "/contents/" + encodedPath;
 
         // 1) Try to GET the existing file to grab its sha.
         String sha = null;

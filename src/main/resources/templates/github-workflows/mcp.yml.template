@@ -1,42 +1,36 @@
 # GitHub Actions workflow shipped inside every generated MCP zip at
-# `.github/workflows/mcp.yml`. Triggered automatically on every push to
-# `main` and on PRs — no manual setup required by the consumer.
-#
-# Available substitutions (filled in by `GeneratorUtils.buildGithubWorkflow`):
-#   ${slug}         — Step-2 slug (e.g. weather-pro-mcp)
-#   ${language}     — typescript | python | java | raw
-#   ${langSteps}    — per-language setup + test steps (setup-node/python/java + run tests)
-#   ${connectorId}  — the connector picked in onboarding (or empty string)
-#
-# Strategy (safe-by-default + opt-in deploy):
-#   1. Always: lint + per-language test (via ${langSteps}).
-#   2. Always: build & push a Docker image to GHCR (uses the built-in
-#      `GITHUB_TOKEN` — no extra secrets required).
-#   3. Optional: deploy to GCP Cloud Run if `GCP_SA_KEY` + `GCP_PROJECT_ID`
-#      repo secrets exist. Skips cleanly otherwise — never fails the build.
-#   4. Optional: deploy to AWS ECS if `AWS_ROLE_ARN` + `AWS_REGION` repo
-#      secrets exist. Skips cleanly otherwise.
-#   5. ${connectorId} is exposed as an env var so downstream steps can
-#      branch on the connector picked at onboarding time.
+# `.github/workflows/mcp.yml`.
+# Flow:
+#   1. Test  — per-language setup + tests (Node 20 / Python 3.11 / Java 17).
+#   2. Build — Docker image, push to Artifact Registry.
+#   3. Deploy — Cloud Run (us-central1), --allow-unauthenticated.
+#   4. URL  — print to job log, GitHub Step Summary, downloadable artifact.
+#   5. Health — probe ${SERVICE_URL}${HEALTH_PATH}, retry 5×.
 
-name: build-and-deploy-${slug}
+name: CI/CD - ${slug} Deploy to Cloud Run
 
 on:
   push:
-    branches: [main]
+    branches:
+      - main
   pull_request:
-    branches: [main]
+    branches:
+      - main
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
-permissions:
-  contents: read
-  packages: write       # for GHCR push
-  id-token: write       # for OIDC-based cloud auth
-
 env:
-  IMAGE_NAME: ghcr.io/${{ github.repository }}/${slug}
-  MCP_LANGUAGE: ${language}
-  MCP_CONNECTOR_ID: "${connectorId}"
+  PROJECT_ID:                    probestack-prod
+  REGION:                        us-central1
+  SERVICE_NAME:                  ${slug}
+  REPOSITORY:                    probestack-prod-apps
+  SERVICE_ACCOUNT_EMAIL:         github-actions-deployer@probestack-prod.iam.gserviceaccount.com
+  WORKLOAD_IDENTITY_PROVIDER:    projects/861433193200/locations/global/workloadIdentityPools/github-pool/providers/github-provider
+  ARTIFACT_REGISTRY_HOST:        us-central1-docker.pkg.dev
+  CONTAINER_PORT:                "${port}"
+  HEALTH_PATH:                   "${healthPath}"
+  MCP_LANGUAGE:                  ${language}
+  MCP_CONNECTOR_ID:              "${connectorId}"
 
 jobs:
   # ───────────────────────────── 1. Test ─────────────────────────────
@@ -44,82 +38,161 @@ jobs:
     name: lint-and-test
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
 ${langSteps}
 
-  # ─────────────────────────── 2. Build & push image ─────────────────
-  build:
-    name: build-image
+  # ───────────────── 2. Build, push to Artifact Registry & deploy ────
+  deploy:
+    name: deploy-to-cloud-run
     needs: test
     runs-on: ubuntu-latest
     if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-    outputs:
-      image-tag: ${{ steps.meta.outputs.tag }}
-    steps:
-      - uses: actions/checkout@v4
-      - name: Log in to GHCR
-        uses: docker/login-action@v3
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Compute image tag
-        id: meta
-        run: echo "tag=$(date -u +%Y%m%d-%H%M%S)-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
-      - name: Build & push
-        uses: docker/build-push-action@v5
-        with:
-          context: .
-          push: true
-          tags: |
-            ${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
-            ${{ env.IMAGE_NAME }}:latest
 
-  # ─────────────────── 3. Optional: deploy to GCP Cloud Run ──────────
-  deploy-gcp:
-    name: deploy-gcp-cloud-run
-    needs: build
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      vars.MCP_TARGET_CLOUD == 'gcp'
+    permissions:
+      contents: read
+      id-token: write
+
+    outputs:
+      service_url:  ${{ steps.svcurl.outputs.service_url }}
+      mcp_url:      ${{ steps.svcurl.outputs.mcp_url }}
+      health_url:   ${{ steps.svcurl.outputs.health_url }}
+
     steps:
-      - name: Auth to GCP
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Authenticate to Google Cloud
+        id: auth
         uses: google-github-actions/auth@v2
         with:
-          credentials_json: ${{ secrets.GCP_SA_KEY }}
-      - name: Deploy to Cloud Run
-        uses: google-github-actions/deploy-cloudrun@v2
-        with:
-          service: ${slug}
-          image: ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }}
-          region: ${{ vars.GCP_REGION || 'us-central1' }}
-          project_id: ${{ secrets.GCP_PROJECT_ID }}
-          flags: --allow-unauthenticated
-      - name: Echo connector context
-        run: |
-          echo "Deployed to GCP Cloud Run using connector: ${MCP_CONNECTOR_ID:-<none>}"
+          workload_identity_provider: ${{ env.WORKLOAD_IDENTITY_PROVIDER }}
+          service_account:            ${{ env.SERVICE_ACCOUNT_EMAIL }}
+          token_format:               access_token
 
-  # ─────────────────── 4. Optional: deploy to AWS ECS ────────────────
-  deploy-aws:
-    name: deploy-aws-ecs
-    needs: build
-    runs-on: ubuntu-latest
-    if: |
-      github.event_name == 'push' &&
-      github.ref == 'refs/heads/main' &&
-      vars.MCP_TARGET_CLOUD == 'aws'
-    steps:
-      - name: Configure AWS credentials (OIDC)
-        uses: aws-actions/configure-aws-credentials@v4
+      - name: Set up Cloud SDK
+        uses: google-github-actions/setup-gcloud@v2
         with:
-          role-to-assume: ${{ secrets.AWS_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION || 'us-east-1' }}
-      - name: Pull image into ECR
+          project_id: ${{ env.PROJECT_ID }}
+
+      - name: Configure Docker for Artifact Registry
+        run: gcloud auth configure-docker ${{ env.ARTIFACT_REGISTRY_HOST }} --quiet
+
+      - name: Build and Push Docker Image
         run: |
-          echo "Pulling ${{ env.IMAGE_NAME }}:${{ needs.build.outputs.image-tag }} → ECR"
-          # TODO: replace with real `aws ecr` + `aws ecs update-service` calls.
-      - name: Echo connector context
+          IMAGE_NAME=${{ env.ARTIFACT_REGISTRY_HOST }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}
+          echo "Building image ${IMAGE_NAME}:${{ github.sha }}"
+          docker build -t ${IMAGE_NAME}:${{ github.sha }} -t ${IMAGE_NAME}:latest .
+          docker push ${IMAGE_NAME}:${{ github.sha }}
+          docker push ${IMAGE_NAME}:latest
+
+      - name: Deploy to Cloud Run
         run: |
-          echo "Deployed to AWS ECS using connector: ${MCP_CONNECTOR_ID:-<none>}"
+          IMAGE_NAME=${{ env.ARTIFACT_REGISTRY_HOST }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}
+          gcloud run deploy ${{ env.SERVICE_NAME }} \
+            --image=${IMAGE_NAME}:${{ github.sha }} \
+            --platform=managed \
+            --region=${{ env.REGION }} \
+            --allow-unauthenticated \
+            --port=${{ env.CONTAINER_PORT }} \
+            --memory=1Gi \
+            --cpu=1 \
+            --min-instances=0 \
+            --max-instances=10 \
+            --timeout=300 \
+            --concurrency=80 \
+            --service-account=${{ env.SERVICE_ACCOUNT_EMAIL }} \
+            --set-env-vars="NODE_ENV=production,PORT=${{ env.CONTAINER_PORT }},MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}" \
+            --quiet
+
+      - name: Get Service URL
+        id: svcurl
+        run: |
+          SERVICE_URL=$(gcloud run services describe ${{ env.SERVICE_NAME }} \
+            --region=${{ env.REGION }} \
+            --format='value(status.url)')
+          MCP_URL="${SERVICE_URL}/mcp"
+          HEALTH_URL="${SERVICE_URL}${HEALTH_PATH}"
+          echo "Service: ${{ env.SERVICE_NAME }}"
+          echo "URL:     ${SERVICE_URL}"
+          echo "service_url=${SERVICE_URL}" >> "$GITHUB_OUTPUT"
+          echo "mcp_url=${MCP_URL}"         >> "$GITHUB_OUTPUT"
+          echo "health_url=${HEALTH_URL}"   >> "$GITHUB_OUTPUT"
+
+      - name: Health Check
+        run: |
+          SERVICE_URL='${{ steps.svcurl.outputs.service_url }}'
+          echo "Probing ${SERVICE_URL}${HEALTH_PATH}"
+          sleep 12
+          for attempt in 1 2 3 4 5; do
+            if curl -fs "${SERVICE_URL}${HEALTH_PATH}"; then
+              echo ""
+              echo "Health check passed on attempt ${attempt}"
+              exit 0
+            fi
+            echo "Attempt ${attempt} failed, retrying in 8s..."
+            sleep 8
+          done
+          echo "Health check failed after 5 attempts"
+          exit 1
+
+      # ──────────────── Surface the deployed URL prominently ─────────────
+      # Three places so it's impossible to miss:
+      #   1. Console banner   — visible in raw job logs.
+      #   2. Step Summary     — clickable URL on the Actions run page.
+      #   3. deployment-url   — uploaded artifact (downloadable from run page).
+      - name: Print Deployed URL Banner
+        run: |
+          SERVICE_URL='${{ steps.svcurl.outputs.service_url }}'
+          MCP_URL='${{ steps.svcurl.outputs.mcp_url }}'
+          HEALTH_URL='${{ steps.svcurl.outputs.health_url }}'
+          echo ""
+          echo "================================================================"
+          echo "  MCP server deployed: ${{ env.SERVICE_NAME }}"
+          echo "----------------------------------------------------------------"
+          echo "  Service URL : ${SERVICE_URL}"
+          echo "  MCP probe   : ${MCP_URL}"
+          echo "  Health      : ${HEALTH_URL}"
+          echo "================================================================"
+          echo ""
+
+      - name: Write Deployed URL to Step Summary
+        run: |
+          SERVICE_URL='${{ steps.svcurl.outputs.service_url }}'
+          MCP_URL='${{ steps.svcurl.outputs.mcp_url }}'
+          HEALTH_URL='${{ steps.svcurl.outputs.health_url }}'
+          {
+            echo "## MCP server deployed"
+            echo ""
+            echo "| | URL |"
+            echo "| --- | --- |"
+            echo "| **Service**    | [${SERVICE_URL}](${SERVICE_URL}) |"
+            echo "| **MCP probe**  | [\`${MCP_URL}\`](${MCP_URL}) |"
+            echo "| **Health**     | [\`${HEALTH_URL}\`](${HEALTH_URL}) |"
+            echo ""
+            echo "Use the **MCP probe** URL from the ForgeSphere Test Studio to invoke tools."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save Deployed URL as Artifact File
+        run: |
+          cat > "${{ github.workspace }}/.deploy-url.json" <<EOF
+          {
+            "service":   "${{ env.SERVICE_NAME }}",
+            "region":    "${{ env.REGION }}",
+            "url":       "${{ steps.svcurl.outputs.service_url }}",
+            "mcpUrl":    "${{ steps.svcurl.outputs.mcp_url }}",
+            "healthUrl": "${{ steps.svcurl.outputs.health_url }}",
+            "sha":       "${{ github.sha }}",
+            "deployedAt":"$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          }
+          EOF
+          echo "Wrote .deploy-url.json:"
+          cat "${{ github.workspace }}/.deploy-url.json"
+
+      - name: Upload Deployed URL Artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-url
+          path: ${{ github.workspace }}/.deploy-url.json
+          if-no-files-found: ignore
+        continue-on-error: true
