@@ -1,5 +1,3 @@
-# GitHub Actions workflow shipped inside every generated MCP zip at
-# `.github/workflows/mcp.yml`.
 # Flow:
 #   1. Test  — per-language setup + tests (Node 20 / Python 3.11 / Java 17).
 #   2. Build — Docker image, push to Artifact Registry.
@@ -24,7 +22,7 @@ env:
   REGION:                        us-central1
   SERVICE_NAME:                  ${slug}
   REPOSITORY:                    probestack-prod-apps
-  SERVICE_ACCOUNT_EMAIL:         github-actions-deployer@probestack-prod.iam.gserviceaccount.com
+  SERVICE_ACCOUNT_EMAIL:         github-actions-forgecrux@probestack-prod.iam.gserviceaccount.com
   WORKLOAD_IDENTITY_PROVIDER:    projects/861433193200/locations/global/workloadIdentityPools/github-pool/providers/github-provider
   ARTIFACT_REGISTRY_HOST:        us-central1-docker.pkg.dev
   CONTAINER_PORT:                "${port}"
@@ -82,9 +80,8 @@ ${langSteps}
         run: |
           IMAGE_NAME=${{ env.ARTIFACT_REGISTRY_HOST }}/${{ env.PROJECT_ID }}/${{ env.REPOSITORY }}/${{ env.SERVICE_NAME }}
           echo "Building image ${IMAGE_NAME}:${{ github.sha }}"
-          docker build -t ${IMAGE_NAME}:${{ github.sha }} -t ${IMAGE_NAME}:latest .
+          docker build -t ${IMAGE_NAME}:${{ github.sha }} .
           docker push ${IMAGE_NAME}:${{ github.sha }}
-          docker push ${IMAGE_NAME}:latest
 
       - name: Deploy to Cloud Run
         run: |
@@ -102,7 +99,7 @@ ${langSteps}
             --timeout=300 \
             --concurrency=80 \
             --service-account=${{ env.SERVICE_ACCOUNT_EMAIL }} \
-            --set-env-vars="NODE_ENV=production,PORT=${{ env.CONTAINER_PORT }},MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}" \
+            --set-env-vars="NODE_ENV=production,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}" \
             --quiet
 
       - name: Get Service URL

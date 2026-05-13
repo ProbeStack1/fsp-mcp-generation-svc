@@ -165,15 +165,36 @@ public final class GeneratorUtils {
                     ENTRYPOINT ["java","-jar","/app/app.jar"]
                     """.formatted(ver.startsWith("java") ? ver.substring(4) : "17");
             default       -> """
-                    FROM node:%s-alpine
+                    # Multi-stage Node build.
+                    #
+                    # WHY a builder stage?  TypeScript (`tsc`) lives under
+                    # devDependencies, so `npm install --production` leaves
+                    # the image without `tsc` and `npm run build` then fails
+                    # with `sh: tsc: not found`.  We install ALL deps, build,
+                    # then copy only what's needed into the runtime image.
+                    FROM node:%s-alpine AS builder
                     WORKDIR /app
                     COPY package.json package-lock.json* ./
-                    RUN npm install --production
+                    # Install every dep, including dev, so `tsc` is present.
+                    # `--no-audit --no-fund` quietens the npm log noise.
+                    RUN npm install --no-audit --no-fund
                     COPY . .
-                    RUN npm run build || true
+                    # Tolerate projects without a build script — some MCPs
+                    # are pure JS / no transpile step.
+                    RUN npm run build --if-present
+                    # Drop devDependencies once the build is done so the
+                    # final image stays small.
+                    RUN npm prune --production
+
+                    FROM node:%s-alpine AS runtime
+                    WORKDIR /app
+                    ENV NODE_ENV=production
+                    COPY --from=builder /app /app
                     EXPOSE 3500
                     CMD ["npm", "start"]
-                    """.formatted(ver.startsWith("node") ? ver.substring(4) : "20");
+                    """.formatted(
+                            ver.startsWith("node") ? ver.substring(4) : "20",
+                            ver.startsWith("node") ? ver.substring(4) : "20");
         };
     }
 
@@ -244,7 +265,16 @@ public final class GeneratorUtils {
      *  Output is indented with 6 spaces so each line sits correctly
      *  under the `steps:` block (which is itself indented 4 spaces
      *  beneath `jobs.<id>:`). Without this indent the substitution
-     *  produces invalid YAML — list items end up at column 0. */
+     *  produces invalid YAML — list items end up at column 0.
+     *
+     *  NOTE: `cache: npm/pip/maven` is intentionally OMITTED because
+     *  the generator does not ship a lock file (package-lock.json /
+     *  requirements.lock / mvnw). setup-node@v4 with `cache: npm`
+     *  errors out at "Dependencies lock file is not found" before
+     *  any run step executes — that's the 5-10 second failure we
+     *  saw on the first real deploy. Without `cache:` the action
+     *  is happy and falls back to a cold install (~15 s extra), and
+     *  every subsequent step works. */
     private static String buildLanguageSteps(String language) {
         String body = switch (language) {
             case "python" -> """
@@ -260,7 +290,6 @@ public final class GeneratorUtils {
                       with:
                         distribution: 'temurin'
                         java-version: '17'
-                        cache: maven
                     - name: Build
                       run: mvn -B -DskipTests package
                     - name: Run tests
@@ -273,7 +302,6 @@ public final class GeneratorUtils {
                     - uses: actions/setup-node@v4
                       with:
                         node-version: '20'
-                        cache: npm
                     - name: Install deps
                       run: npm ci || npm install
                     - name: Run tests
