@@ -172,6 +172,29 @@ public class McpProjectController {
         return Envelope.ok(bridgeSvc.pushToGitHub(p));
     }
 
+    /**
+     * Read-only workflow-run lookup. Replaces the senior team's
+     * `/api-development/v1/api-development/{msId}/deploy-to-github/latest-run`
+     * endpoint which is currently broken by a uniform-bucket-level-access
+     * policy on their GCS bucket. We use the same connector PAT that
+     * pushed the files to call the GitHub Runs API directly. Response
+     * shape matches what the senior endpoint used to return so the
+     * front-end's `DeployStatusPanel` works without changes.
+     */
+    @GetMapping("/{id}/workflow-runs/latest")
+    public Envelope<Map<String, Object>> latestWorkflowRun(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        return Envelope.ok(bridgeSvc.getLatestWorkflowRun(p));
+    }
+
+    /** Per-job/step matrix for a single workflow run id. Drives the 11-step animation. */
+    @GetMapping("/{id}/workflow-runs/{runId}/steps")
+    public Envelope<Map<String, Object>> workflowRunSteps(@PathVariable String id,
+                                                          @PathVariable String runId) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        return Envelope.ok(bridgeSvc.getWorkflowRunSteps(p, runId));
+    }
+
     // ------------- Client configs -------------
     @GetMapping("/{id}/client-configs")
     public Envelope<Map<String, Object>> configs(@PathVariable String id) {

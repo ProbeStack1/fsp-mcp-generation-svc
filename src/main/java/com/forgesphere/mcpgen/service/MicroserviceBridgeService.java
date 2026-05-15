@@ -874,4 +874,255 @@ public class MicroserviceBridgeService {
             throw new RuntimeException("Failed to build zip bytes for mirror: " + e.getMessage(), e);
         }
     }
+
+    // ────────────────────────────────────────────────────────────────────
+    // Workflow-run lookups — replaces senior's api-development endpoint
+    // which is currently broken by a GCS uniform-bucket-level-access
+    // policy. We hit the GitHub Runs API directly using the same
+    // connector PAT we used to push files. Repo-scoped reads only — no
+    // writes — so this stays read-safe.
+    // ────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns a normalised "latest run" payload that matches the shape
+     * the senior team's /deploy-to-github/latest-run endpoint returned
+     * before it broke. Fields:
+     *
+     *   { repo, repoName, runFound, runId, deploymentStatus, deployedServiceUrl?,
+     *     run: { id, name, displayTitle, status, conclusion, htmlUrl, createdAt, updatedAt } }
+     *
+     * `deploymentStatus` is derived: completed+success → SUCCESS,
+     * completed+failure|cancelled|timed_out → FAILED, anything else → IN_PROGRESS.
+     */
+    public Map<String, Object> getLatestWorkflowRun(McpProject project) {
+        var creds = resolveGitHubCreds(project);
+        if (creds == null) {
+            return Map.of("runFound", false, "message", "No GitHub connector configured");
+        }
+
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        String url = "https://api.github.com/repos/" + creds.orgOrUser + "/" + creds.repo
+                + "/actions/runs?per_page=5";
+        try {
+            var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
+                    .header("Authorization", "Bearer " + creds.token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                log.warn("[runs] GitHub list-runs {} {}", resp.statusCode(), resp.body());
+                return Map.of("runFound", false, "message", "GitHub list-runs failed: " + resp.statusCode());
+            }
+            // Pull the first run + minimal status fields via shallow JSON parsing
+            // so we don't need to pull a JSON library purely for this.
+            String body = resp.body();
+            Map<String, Object> firstRun = parseFirstRun(body);
+            String repoFullName = creds.orgOrUser + "/" + creds.repo;
+            if (firstRun == null) {
+                return Map.of("runFound", false, "repo", repoFullName);
+            }
+            String status     = (String) firstRun.getOrDefault("status", "");
+            String conclusion = (String) firstRun.getOrDefault("conclusion", "");
+            String deployStatus = "IN_PROGRESS";
+            if ("completed".equalsIgnoreCase(status)) {
+                deployStatus = switch (conclusion.toLowerCase()) {
+                    case "success"            -> "SUCCESS";
+                    case "failure", "cancelled", "timed_out" -> "FAILED";
+                    default                   -> "COMPLETED";
+                };
+            }
+
+            // Persist key fields onto McpProject so the dashboard /
+            // listings have up-to-date workflow state too.
+            try {
+                project.setLatestRunId(String.valueOf(firstRun.get("id")));
+                project.setLatestRunStatus(status);
+                project.setLatestRunConclusion(conclusion);
+                project.setLatestRunUrl((String) firstRun.get("htmlUrl"));
+                project.setLatestRunCheckedAt(java.time.Instant.now());
+                projects.save(project);
+            } catch (Exception ignore) { /* best-effort persistence */ }
+
+            Map<String, Object> out = new java.util.LinkedHashMap<>();
+            out.put("repo", repoFullName);
+            out.put("repoName", creds.repo);
+            out.put("runFound", true);
+            out.put("runId", firstRun.get("id"));
+            out.put("deploymentStatus", deployStatus);
+            if (project.getDeployedServiceUrl() != null) {
+                out.put("deployedServiceUrl", project.getDeployedServiceUrl());
+            }
+            out.put("run", firstRun);
+            return out;
+        } catch (Exception e) {
+            log.warn("[runs] latest-run lookup failed: {}", e.getMessage());
+            return Map.of("runFound", false, "error", e.getMessage());
+        }
+    }
+
+    /**
+     * Returns per-job step matrix for one workflow run id. Same response
+     * shape we ask the senior endpoint to give us — `{ jobs: [{ name,
+     * status, conclusion, steps: [{ name, status, conclusion }] }] }` —
+     * so the DeployStatusPanel can animate the 11 mcp.yml steps without
+     * caring whether the data came from us or them.
+     */
+    public Map<String, Object> getWorkflowRunSteps(McpProject project, String runId) {
+        if (runId == null || runId.isBlank()) return Map.of("jobs", java.util.List.of());
+        var creds = resolveGitHubCreds(project);
+        if (creds == null) return Map.of("jobs", java.util.List.of());
+
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        String url = "https://api.github.com/repos/" + creds.orgOrUser + "/" + creds.repo
+                + "/actions/runs/" + runId + "/jobs";
+        try {
+            var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
+                    .header("Authorization", "Bearer " + creds.token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) return Map.of("jobs", java.util.List.of());
+            return Map.of("jobs", parseJobs(resp.body()));
+        } catch (Exception e) {
+            log.warn("[runs] steps lookup failed: {}", e.getMessage());
+            return Map.of("jobs", java.util.List.of());
+        }
+    }
+
+    // Internal connector-credential record returned by resolveGitHubCreds.
+    private record GhCreds(String token, String orgOrUser, String repo) {}
+
+    /** Reads {token, orgOrUser, repo} off the project's connector. */
+    private GhCreds resolveGitHubCreds(McpProject project) {
+        String connectorId = resolveConnectorId(project);
+        if (connectorId == null) return null;
+        org.bson.Document conn = bridgeColl(props.getColl().getConnector())
+                .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
+                .first();
+        if (conn == null) return null;
+        org.bson.Document scm = conn.get("sourceCodeManagement", org.bson.Document.class);
+        if (scm == null) return null;
+        String token = scm.getString("token");
+        String orgOrUser = scm.getString("orgOrUser");
+        String repo = scm.getString("repo");
+        if (token == null || orgOrUser == null || repo == null) return null;
+        return new GhCreds(token, orgOrUser, repo);
+    }
+
+    /**
+     * Shallow JSON parser for the runs-list response — we only need
+     * id/name/status/conclusion/htmlUrl/createdAt/updatedAt of the
+     * first entry. Avoids adding a JSON binding library for one method.
+     */
+    private static Map<String, Object> parseFirstRun(String body) {
+        int idx = body.indexOf("\"workflow_runs\":[");
+        if (idx < 0) return null;
+        int start = body.indexOf('{', idx);
+        if (start < 0) return null;
+        int depth = 0, end = start;
+        for (int i = start; i < body.length(); i++) {
+            char c = body.charAt(i);
+            if (c == '{') depth++;
+            else if (c == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
+        }
+        String slice = body.substring(start, end);
+        Map<String, Object> out = new java.util.LinkedHashMap<>();
+        out.put("id",            extractLong   (slice, "id"));
+        out.put("name",          extractString (slice, "name"));
+        out.put("displayTitle",  extractString (slice, "display_title"));
+        out.put("status",        extractString (slice, "status"));
+        out.put("conclusion",    extractString (slice, "conclusion"));
+        out.put("htmlUrl",       extractString (slice, "html_url"));
+        out.put("createdAt",     extractString (slice, "created_at"));
+        out.put("updatedAt",     extractString (slice, "updated_at"));
+        return out;
+    }
+
+    /** Same approach for the /jobs endpoint — pulls each job + its steps. */
+    private static java.util.List<Map<String, Object>> parseJobs(String body) {
+        java.util.List<Map<String, Object>> jobs = new java.util.ArrayList<>();
+        int idx = body.indexOf("\"jobs\":[");
+        if (idx < 0) return jobs;
+        int cursor = idx + 8;
+        while (cursor < body.length()) {
+            int start = body.indexOf('{', cursor);
+            if (start < 0) break;
+            int depth = 0, end = start;
+            for (int i = start; i < body.length(); i++) {
+                char c = body.charAt(i);
+                if (c == '{') depth++;
+                else if (c == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
+            }
+            String jobSlice = body.substring(start, end);
+            Map<String, Object> job = new java.util.LinkedHashMap<>();
+            job.put("name",       extractString(jobSlice, "name"));
+            job.put("status",     extractString(jobSlice, "status"));
+            job.put("conclusion", extractString(jobSlice, "conclusion"));
+            job.put("steps",      parseSteps(jobSlice));
+            jobs.add(job);
+            cursor = end + 1;
+            // Stop when we leave the jobs array (depth tracking is
+            // expensive; we just break on `]` immediately after the job).
+            int nextComma = body.indexOf(',', cursor);
+            int closeArr = body.indexOf(']', cursor);
+            if (closeArr > 0 && (nextComma < 0 || closeArr < nextComma)) break;
+        }
+        return jobs;
+    }
+
+    private static java.util.List<Map<String, Object>> parseSteps(String jobSlice) {
+        java.util.List<Map<String, Object>> steps = new java.util.ArrayList<>();
+        int idx = jobSlice.indexOf("\"steps\":[");
+        if (idx < 0) return steps;
+        int cursor = idx + 9;
+        while (cursor < jobSlice.length()) {
+            int start = jobSlice.indexOf('{', cursor);
+            int closeArr = jobSlice.indexOf(']', cursor);
+            if (start < 0 || (closeArr > 0 && closeArr < start)) break;
+            int depth = 0, end = start;
+            for (int i = start; i < jobSlice.length(); i++) {
+                char c = jobSlice.charAt(i);
+                if (c == '{') depth++;
+                else if (c == '}') { depth--; if (depth == 0) { end = i + 1; break; } }
+            }
+            String stepSlice = jobSlice.substring(start, end);
+            Map<String, Object> step = new java.util.LinkedHashMap<>();
+            step.put("name",       extractString(stepSlice, "name"));
+            step.put("status",     extractString(stepSlice, "status"));
+            step.put("conclusion", extractString(stepSlice, "conclusion"));
+            steps.add(step);
+            cursor = end + 1;
+        }
+        return steps;
+    }
+
+    private static String extractString(String slice, String key) {
+        String marker = "\"" + key + "\":";
+        int i = slice.indexOf(marker);
+        if (i < 0) return null;
+        int from = i + marker.length();
+        while (from < slice.length() && Character.isWhitespace(slice.charAt(from))) from++;
+        if (from >= slice.length()) return null;
+        if (slice.charAt(from) == 'n') return null;            // null
+        if (slice.charAt(from) != '"') return null;            // not a string
+        int end = slice.indexOf('"', from + 1);
+        return end > from ? slice.substring(from + 1, end) : null;
+    }
+
+    private static Long extractLong(String slice, String key) {
+        String marker = "\"" + key + "\":";
+        int i = slice.indexOf(marker);
+        if (i < 0) return null;
+        int from = i + marker.length();
+        StringBuilder sb = new StringBuilder();
+        while (from < slice.length()) {
+            char c = slice.charAt(from);
+            if (Character.isDigit(c)) sb.append(c);
+            else if (!sb.isEmpty()) break;
+            else if (!Character.isWhitespace(c)) break;
+            from++;
+        }
+        if (sb.isEmpty()) return null;
+        try { return Long.parseLong(sb.toString()); } catch (NumberFormatException e) { return null; }
+    }
 }
