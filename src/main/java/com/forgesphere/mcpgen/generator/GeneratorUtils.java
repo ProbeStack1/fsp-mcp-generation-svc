@@ -154,8 +154,9 @@ public final class GeneratorUtils {
                     COPY requirements.txt .
                     RUN pip install --no-cache-dir -r requirements.txt
                     COPY . .
-                    EXPOSE 3500
-                    CMD ["python", "-m", "server"]
+                    ENV PORT=8080
+                    EXPOSE 8080
+                    CMD ["python", "server.py"]
                     """.formatted(ver.startsWith("py") ? ver.substring(2) : "3.12");
             case "java"   -> """
                     FROM eclipse-temurin:%s-jre
@@ -246,9 +247,23 @@ public final class GeneratorUtils {
                 .replace("${slug}",        slug)
                 .replace("${language}",    lang)
                 .replace("${langSteps}",   buildLanguageSteps(lang))
+                .replace("${langEnvVars}", buildLanguageEnvVars(lang))
                 .replace("${connectorId}", connectorId)
                 .replace("${port}",        port)
                 .replace("${healthPath}",  healthPath);
+    }
+
+    /**
+     * Per-language `--set-env-vars` payload for the Cloud Run deploy
+     * step. Different runtimes have different conventional env vars; we
+     * keep this list focused so the deploy line stays readable.
+     */
+    private static String buildLanguageEnvVars(String language) {
+        return switch (language) {
+            case "python" -> "PYTHONUNBUFFERED=1,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}";
+            case "java"   -> "SPRING_PROFILES_ACTIVE=cloud,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}";
+            default       -> "NODE_ENV=production,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}";
+        };
     }
 
     /** Best-effort classpath read; returns {@code null} on any error. */

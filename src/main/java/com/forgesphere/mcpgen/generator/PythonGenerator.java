@@ -28,7 +28,9 @@ public class PythonGenerator implements CodeGenerator {
 
         List<GeneratedFile> files = new ArrayList<>();
 
-        files.add(file("requirements.txt", "mcp>=1.2.0\nuvicorn>=0.25.0\n", "plaintext"));
+        files.add(file("requirements.txt",
+                "mcp>=1.2.0\nuvicorn>=0.25.0\nstarlette>=0.36.0\n",
+                "plaintext"));
         files.add(file("pyproject.toml", """
                 [project]
                 name = "%s"
@@ -82,8 +84,36 @@ public class PythonGenerator implements CodeGenerator {
         py.append("if __name__ == \"__main__\":\n");
         if (stdio) py.append("    mcp.run()\n");
         else {
-            py.append("    port = int(os.environ.get(\"PORT\", 3500))\n");
-            py.append("    mcp.run(transport=\"streamable-http\", host=\"0.0.0.0\", port=port)\n");
+            // For streamable-http we wrap the FastMCP app inside a tiny
+            // Starlette app so we can add a `/healthz` route alongside
+            // the MCP endpoint. Cloud Run's deploy pipeline curls
+            // `/healthz` to confirm the rollout — without this route
+            // the deploy is marked failed.
+            //
+            // `/docs` returns the wizard manifest (mcp.json) as JSON so
+            // an LLM-aware client can discover the tools/resources
+            // without speaking JSON-RPC first.
+            py.append("    from starlette.applications import Starlette\n");
+            py.append("    from starlette.responses import JSONResponse, FileResponse\n");
+            py.append("    from starlette.routing import Route, Mount\n");
+            py.append("    import uvicorn, json, pathlib\n\n");
+            py.append("    async def healthz(_request):\n");
+            py.append("        return JSONResponse({\"status\": \"ok\", \"service\": ")
+              .append(quote(id == null ? "mcp-server" : id.getDisplayName()))
+              .append("})\n\n");
+            py.append("    async def docs(_request):\n");
+            py.append("        path = pathlib.Path(__file__).parent / \"mcp.json\"\n");
+            py.append("        if path.exists():\n");
+            py.append("            return FileResponse(path, media_type=\"application/json\")\n");
+            py.append("        return JSONResponse({\"error\": \"mcp.json not found\"}, status_code=404)\n\n");
+            py.append("    app = Starlette(routes=[\n");
+            py.append("        Route(\"/healthz\", healthz),\n");
+            py.append("        Route(\"/readyz\", healthz),\n");
+            py.append("        Route(\"/docs\", docs),\n");
+            py.append("        Mount(\"/\", app=mcp.streamable_http_app()),\n");
+            py.append("    ])\n");
+            py.append("    port = int(os.environ.get(\"PORT\", 8080))\n");
+            py.append("    uvicorn.run(app, host=\"0.0.0.0\", port=port)\n");
         }
         files.add(file("server.py", py.toString(), "python"));
 

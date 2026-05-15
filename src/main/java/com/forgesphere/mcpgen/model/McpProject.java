@@ -118,6 +118,12 @@ public class McpProject {
     private String  latestRunUrl;
     private Instant latestRunCheckedAt;
 
+    /** Deployed service base URL parsed from the workflow's `deployment-url`
+     *  artifact. Surfaced on the Test Studio "auto-register" flow and on the
+     *  Dashboard MCP card so users land on the live URL with one click. */
+    private String  deployedServiceUrl;
+    private Instant deployedAt;
+
     // ---------------- nested types ----------------
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor

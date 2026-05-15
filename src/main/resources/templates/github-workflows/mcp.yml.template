@@ -99,7 +99,7 @@ ${langSteps}
             --timeout=300 \
             --concurrency=80 \
             --service-account=${{ env.SERVICE_ACCOUNT_EMAIL }} \
-            --set-env-vars="NODE_ENV=production,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}" \
+            --set-env-vars="${langEnvVars}" \
             --quiet
 
       - name: Get Service URL

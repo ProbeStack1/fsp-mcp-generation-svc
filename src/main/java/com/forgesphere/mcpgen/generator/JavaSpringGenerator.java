@@ -12,9 +12,15 @@ import java.util.List;
  * project that wires up the MCP HTTP transport and exposes one
  * placeholder controller per tool. The user implements the tool body.
  *
- * Note: the official Anthropic SDK is JS / Python-first; for JVM we
- * rely on a community-maintained shim + raw JSON-RPC over HTTP. The
- * scaffold makes this explicit in the README.
+ * Notes on what's emitted:
+ *   • `HealthController` — exposes `/healthz` (and `/readyz`) returning
+ *     `{"status":"ok"}`. Cloud Run's deploy workflow probes this so the
+ *     image is only considered healthy once Spring has finished boot.
+ *   • `OpenApiConfig` — wires up springdoc-openapi-ui. Swagger UI is
+ *     served at `/swagger-ui.html` and the raw spec at `/v3/api-docs`.
+ *   • `application.properties` listens on `${PORT:8080}` — Cloud Run
+ *     injects `PORT=8080` so the JAR boots straight into the right
+ *     port without any extra wiring.
  */
 @Component
 public class JavaSpringGenerator implements CodeGenerator {
@@ -26,14 +32,18 @@ public class JavaSpringGenerator implements CodeGenerator {
         var id   = spec.getIdentity();
         String artifact = id == null ? "mcp-server" : id.getSlug();
         String groupId  = "com.forgesphere.generated";
+        String pkgLeaf  = artifact.replace("-", "").toLowerCase();
+        String pkg      = groupId + "." + pkgLeaf;
+        String displayName = id == null ? "mcp-server" : id.getDisplayName();
+        String displayQuoted = "\"" + displayName.replace("\"", "\\\"") + "\"";
 
         List<GeneratedFile> files = new ArrayList<>();
 
         files.add(file("pom.xml", pom(groupId, artifact), "xml"));
 
-        String pkgDir = "src/main/java/" + groupId.replace('.', '/') + "/" + artifact.replace("-", "");
+        String pkgDir = "src/main/java/" + groupId.replace('.', '/') + "/" + pkgLeaf;
         files.add(file(pkgDir + "/Application.java", """
-                package %s.%s;
+                package %s;
 
                 import org.springframework.boot.SpringApplication;
                 import org.springframework.boot.autoconfigure.SpringBootApplication;
@@ -42,10 +52,61 @@ public class JavaSpringGenerator implements CodeGenerator {
                 public class Application {
                     public static void main(String[] args) { SpringApplication.run(Application.class, args); }
                 }
-                """.formatted(groupId, artifact.replace("-", "")), "java"));
+                """.formatted(pkg), "java"));
+
+        files.add(file(pkgDir + "/HealthController.java", """
+                package %s;
+
+                import org.springframework.web.bind.annotation.GetMapping;
+                import org.springframework.web.bind.annotation.RestController;
+                import java.util.Map;
+
+                /**
+                 * Lightweight liveness + readiness endpoints. Cloud Run's deploy
+                 * pipeline curls `/healthz` after a rollout — the deploy is only
+                 * marked successful once this returns 200.
+                 */
+                @RestController
+                public class HealthController {
+                    @GetMapping("/healthz")
+                    public Map<String, Object> healthz() {
+                        return Map.of("status", "ok", "service", %s);
+                    }
+
+                    @GetMapping("/readyz")
+                    public Map<String, Object> readyz() {
+                        return Map.of("status", "ready", "service", %s);
+                    }
+                }
+                """.formatted(pkg, displayQuoted, displayQuoted), "java"));
+
+        files.add(file(pkgDir + "/OpenApiConfig.java", """
+                package %s;
+
+                import io.swagger.v3.oas.models.OpenAPI;
+                import io.swagger.v3.oas.models.info.Info;
+                import org.springframework.context.annotation.Bean;
+                import org.springframework.context.annotation.Configuration;
+
+                /**
+                 * Swagger UI lives at `/swagger-ui.html` (springdoc default) and
+                 * the raw OpenAPI document at `/v3/api-docs`. Both routes are
+                 * automatically wired by `springdoc-openapi-starter-webmvc-ui`.
+                 */
+                @Configuration
+                public class OpenApiConfig {
+                    @Bean
+                    public OpenAPI openApi() {
+                        return new OpenAPI().info(new Info()
+                                .title(%s)
+                                .version("0.1.0")
+                                .description("Auto-generated MCP server endpoints."));
+                    }
+                }
+                """.formatted(pkg, displayQuoted), "java"));
 
         files.add(file(pkgDir + "/McpController.java", """
-                package %s.%s;
+                package %s;
 
                 import org.springframework.web.bind.annotation.*;
                 import java.util.*;
@@ -94,17 +155,24 @@ public class JavaSpringGenerator implements CodeGenerator {
                         return "TODO: implement " + name + " with " + args;
                     }
                 }
-                """.formatted(groupId, artifact.replace("-", ""),
-                '"' + (id == null ? "mcp-server" : id.getDisplayName()) + '"'), "java"));
+                """.formatted(pkg, displayQuoted), "java"));
 
         files.add(file("src/main/resources/application.properties",
-                "server.port=${PORT:3500}\nspring.application.name=" + artifact + "\n", "properties"));
+                "server.port=${PORT:8080}\nspring.application.name=" + artifact + "\nspringdoc.swagger-ui.path=/swagger-ui.html\nspringdoc.api-docs.path=/v3/api-docs\n",
+                "properties"));
 
         files.add(file(".env.example", GeneratorUtils.envExample(spec), "dotenv"));
-        files.add(file("Dockerfile", GeneratorUtils.dockerfile(spec), "docker"));
+        files.add(file("Dockerfile", dockerfile(spec, artifact), "docker"));
         files.add(file("mcp.json", GeneratorUtils.pretty(GeneratorUtils.manifest(spec)), "json"));
         files.add(file("README.md", GeneratorUtils.commonReadme(spec) +
-                "\n## Run locally\n\n```bash\n./mvnw spring-boot:run\n# or:\n./mvnw package && java -jar target/" + artifact + "-0.1.0.jar\n```\n", "markdown"));
+                "\n## Run locally\n\n```bash\nmvn spring-boot:run\n# or:\nmvn package && java -jar target/" + artifact + "-0.1.0.jar\n```\n\n" +
+                "## Endpoints\n\n" +
+                "- `POST /mcp`            — JSON-RPC entry point\n" +
+                "- `GET  /healthz`        — liveness probe (used by Cloud Run deploy)\n" +
+                "- `GET  /readyz`         — readiness probe\n" +
+                "- `GET  /swagger-ui.html` — interactive API docs\n" +
+                "- `GET  /v3/api-docs`    — raw OpenAPI document\n",
+                "markdown"));
         files.add(file(".gitignore", "target/\n.mvn/wrapper/maven-wrapper.jar\n.idea/\n*.iml\n.env\n", "gitignore"));
 
 
@@ -141,16 +209,59 @@ public class JavaSpringGenerator implements CodeGenerator {
                   </properties>
 
                   <dependencies>
-                    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-web</artifactId></dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-web</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springframework.boot</groupId>
+                      <artifactId>spring-boot-starter-actuator</artifactId>
+                    </dependency>
+                    <dependency>
+                      <groupId>org.springdoc</groupId>
+                      <artifactId>springdoc-openapi-starter-webmvc-ui</artifactId>
+                      <version>2.3.0</version>
+                    </dependency>
                   </dependencies>
 
                   <build>
+                    <finalName>%s-0.1.0</finalName>
                     <plugins>
                       <plugin><groupId>org.springframework.boot</groupId><artifactId>spring-boot-maven-plugin</artifactId></plugin>
                     </plugins>
                   </build>
                 </project>
-                """.formatted(groupId, artifact);
+                """.formatted(groupId, artifact, artifact);
+    }
+
+    /**
+     * Build a self-contained Dockerfile that runs `mvn package` inside the
+     * build stage so the Cloud Run runner doesn't need a pre-built JAR.
+     * `EXPOSE 8080` matches the port Cloud Run forwards traffic to.
+     */
+    private String dockerfile(McpProject spec, String artifact) {
+        String javaVer = "17";
+        if (spec.getRuntime() != null && spec.getRuntime().getLanguageVersion() != null
+                && spec.getRuntime().getLanguageVersion().startsWith("java")) {
+            javaVer = spec.getRuntime().getLanguageVersion().substring(4);
+        }
+        return """
+                # ── Builder stage ───────────────────────────────────────────
+                FROM maven:3.9-eclipse-temurin-%s AS builder
+                WORKDIR /build
+                COPY pom.xml ./
+                RUN mvn -B -q dependency:go-offline
+                COPY src ./src
+                RUN mvn -B -q -DskipTests package
+
+                # ── Runtime stage ───────────────────────────────────────────
+                FROM eclipse-temurin:%s-jre
+                WORKDIR /app
+                COPY --from=builder /build/target/%s-0.1.0.jar /app/app.jar
+                ENV PORT=8080
+                EXPOSE 8080
+                ENTRYPOINT ["java","-jar","/app/app.jar"]
+                """.formatted(javaVer, javaVer, artifact);
     }
 
     private GeneratedFile file(String path, String content, String hint) {
