@@ -260,11 +260,14 @@ public class McpProjectController {
     public Envelope<Map<String, Object>> latestWorkflowRun(@PathVariable String id) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
         Map<String, Object> out = bridgeSvc.getLatestWorkflowRun(p);
-        // Dedupe-by-runId: only append a deploy entry the first time we
-        // observe a given runId's terminal status. Subsequent polls
-        // (the front-end refreshes every few seconds) won't bloat the
-        // audit history. Actor is derived from the project's last
-        // editor (`updatedBy`) since GitHub-Actions polling is anonymous.
+        // ── Upsert-on-any-status audit write ─────────────────────────
+        // Earlier this block only recorded when `status="completed"`,
+        // which meant the `totalDeploys` counter stayed at 0 until the
+        // workflow finished. User feedback: "deploy start hote hi
+        // count badhna chahiye". We now call `upsertDeployFromPoll`
+        // on ANY runId — first sighting inserts (counter +1), later
+        // sightings update the same row, and a terminal transition
+        // bumps success/failed exactly once.
         try {
             McpProject fresh = svc.get(id).orElse(p);
             String runId      = (String) out.get("runId");
@@ -272,60 +275,47 @@ public class McpProjectController {
             String conclusion = (String) out.get("conclusion");
             String runUrl     = (String) out.get("htmlUrl");
             String deployed   = fresh.getDeployedServiceUrl();
-            if (runId != null && "completed".equalsIgnoreCase(status)) {
-                var trail = audit.ensure(fresh);
-                boolean already = trail.getDeployHistory().stream()
-                        .anyMatch(e -> runId.equals(e.getRunId()) && "completed".equalsIgnoreCase(e.getStatus()));
-                if (!already) {
-                    // ── Failure attribution ──────────────────────────────
-                    // When the run failed we pull the per-step matrix and
-                    // identify the first step whose conclusion is failure /
-                    // cancelled / timed_out. That step's name becomes
-                    // `failedStep` and a one-line summary becomes
-                    // `failedReason` — so the catalog & wizard history
-                    // rows can show *why* a deploy failed without the user
-                    // having to click into GitHub Actions.
-                    String failedStep   = null;
-                    String failedReason = null;
-                    if (conclusion != null && !"success".equalsIgnoreCase(conclusion)) {
-                        try {
-                            Map<String, Object> steps = bridgeSvc.getWorkflowRunSteps(fresh, runId);
+            if (runId != null && !runId.isBlank()) {
+                // Failure attribution — only meaningful at terminal time.
+                String failedStep   = null;
+                String failedReason = null;
+                boolean terminal = "completed".equalsIgnoreCase(status)
+                        && conclusion != null && !"success".equalsIgnoreCase(conclusion);
+                if (terminal) {
+                    try {
+                        Map<String, Object> steps = bridgeSvc.getWorkflowRunSteps(fresh, runId);
+                        @SuppressWarnings("unchecked")
+                        java.util.List<Map<String, Object>> jobs =
+                                (java.util.List<Map<String, Object>>) steps.getOrDefault("jobs", java.util.List.of());
+                        outer:
+                        for (Map<String, Object> job : jobs) {
                             @SuppressWarnings("unchecked")
-                            java.util.List<Map<String, Object>> jobs =
-                                    (java.util.List<Map<String, Object>>) steps.getOrDefault("jobs", java.util.List.of());
-                            outer:
-                            for (Map<String, Object> job : jobs) {
-                                @SuppressWarnings("unchecked")
-                                java.util.List<Map<String, Object>> sList =
-                                        (java.util.List<Map<String, Object>>) job.getOrDefault("steps", java.util.List.of());
-                                for (Map<String, Object> step : sList) {
-                                    String sConcl = String.valueOf(step.getOrDefault("conclusion", ""));
-                                    if ("failure".equalsIgnoreCase(sConcl)
-                                            || "cancelled".equalsIgnoreCase(sConcl)
-                                            || "timed_out".equalsIgnoreCase(sConcl)) {
-                                        failedStep   = String.valueOf(step.getOrDefault("name", "(unknown)"));
-                                        failedReason = "Step \"" + failedStep + "\" reported "
-                                                + sConcl.toLowerCase()
-                                                + " in job \"" + job.getOrDefault("name", "?") + "\". "
-                                                + "Open the workflow run on GitHub for the full byte-by-byte log.";
-                                        break outer;
-                                    }
+                            java.util.List<Map<String, Object>> sList =
+                                    (java.util.List<Map<String, Object>>) job.getOrDefault("steps", java.util.List.of());
+                            for (Map<String, Object> step : sList) {
+                                String sConcl = String.valueOf(step.getOrDefault("conclusion", ""));
+                                if ("failure".equalsIgnoreCase(sConcl)
+                                        || "cancelled".equalsIgnoreCase(sConcl)
+                                        || "timed_out".equalsIgnoreCase(sConcl)) {
+                                    failedStep   = String.valueOf(step.getOrDefault("name", "(unknown)"));
+                                    failedReason = "Step \"" + failedStep + "\" reported "
+                                            + sConcl.toLowerCase()
+                                            + " in job \"" + job.getOrDefault("name", "?") + "\". "
+                                            + "Open the workflow run on GitHub for the full byte-by-byte log.";
+                                    break outer;
                                 }
                             }
-                        } catch (Exception ignore) {
-                            // Best-effort — keep recording the deploy even
-                            // if step lookup fails.
                         }
-                        if (failedStep == null) {
-                            failedStep   = "deploy-to-cloud-run";
-                            failedReason = "Workflow concluded \"" + conclusion + "\". Open the run on GitHub for details.";
-                        }
+                    } catch (Exception ignore) { /* best-effort */ }
+                    if (failedStep == null) {
+                        failedStep   = "deploy-to-cloud-run";
+                        failedReason = "Workflow concluded \"" + conclusion + "\". Open the run on GitHub for details.";
                     }
-                    audit.recordDeploy(fresh, actorFromBody(fresh.getUpdatedBy(), fresh),
-                            runId, runUrl, status, conclusion, deployed, null,
-                            failedStep, failedReason, null, fresh.getPushedCommitSha());
-                    audit.save(fresh);
                 }
+                audit.upsertDeployFromPoll(fresh, actorFromBody(fresh.getUpdatedBy(), fresh),
+                        runId, runUrl, status, conclusion, deployed, null,
+                        failedStep, failedReason, fresh.getPushedCommitSha());
+                audit.save(fresh);
             }
         } catch (Exception ex) {
             // Audit is best-effort — never block the wizard's status poll.

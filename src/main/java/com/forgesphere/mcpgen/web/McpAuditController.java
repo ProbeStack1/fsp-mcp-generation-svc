@@ -4,6 +4,7 @@ import com.forgesphere.mcpgen.dto.Dtos.Envelope;
 import com.forgesphere.mcpgen.model.McpProject;
 import com.forgesphere.mcpgen.model.McpProject.AuditTrail;
 import com.forgesphere.mcpgen.model.McpProject.DeployEntry;
+import com.forgesphere.mcpgen.schedule.DeployStatusReaper;
 import com.forgesphere.mcpgen.service.AuditService;
 import com.forgesphere.mcpgen.service.McpGenerationService;
 import lombok.RequiredArgsConstructor;
@@ -32,11 +33,49 @@ public class McpAuditController {
 
     private final McpGenerationService svc;
     private final AuditService audit;
+    private final DeployStatusReaper reaper;
 
     @GetMapping("/{id}/audit")
     public Envelope<AuditTrail> audit(@PathVariable String id) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
         return Envelope.ok(audit.ensure(p));
+    }
+
+    /**
+     * Trigger an IMMEDIATE backend poll for this project's latest
+     * workflow run + audit write. Use this to reconcile counters
+     * when the frontend polling was interrupted (browser tab closed
+     * mid-deploy, network drop, etc.).
+     *
+     * Differs from `GET /workflow-runs/latest` in two ways:
+     *   1. Returns the audit row *delta* (was the latest run
+     *      already recorded, or did we just write it?).
+     *   2. Idempotent — calling it 100x in a row writes at most one
+     *      new audit entry (same dedup-by-runId logic).
+     *
+     * For a full multi-run backfill we'd have to query GitHub's
+     * `/runs` paginated endpoint — currently out of scope.
+     */
+    @PostMapping("/{id}/audit/reconcile")
+    public Envelope<Map<String, Object>> reconcile(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        Map<String, Object> result = new LinkedHashMap<>();
+        result.put("projectId", p.getId());
+
+        int beforeCount = audit.ensure(p).getDeployHistory().size();
+        // Delegate to the same reaper that the scheduler uses so we
+        // never diverge between manual + automatic reconciliation.
+        boolean wrote = reaper.pollOneForController(p);
+        // Re-fetch to get the absolute latest counters after the write.
+        McpProject fresh = svc.get(id).orElse(p);
+        var trail = audit.ensure(fresh);
+        result.put("wroteNewEntry", wrote);
+        result.put("beforeEntries", beforeCount);
+        result.put("afterEntries",  trail.getDeployHistory().size());
+        result.put("totalDeploys",        trail.getTotalDeploys());
+        result.put("totalDeploysSuccess", trail.getTotalDeploysSuccess());
+        result.put("totalDeploysFailed",  trail.getTotalDeploysFailed());
+        return Envelope.ok(result);
     }
 
     @GetMapping("/{id}/deployments")

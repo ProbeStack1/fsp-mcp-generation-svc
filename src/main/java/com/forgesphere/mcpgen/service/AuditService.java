@@ -122,6 +122,95 @@ public class AuditService {
         return e;
     }
 
+    /**
+     * Upsert-by-runId variant used by polling paths (controller +
+     * scheduled reaper). Semantics that match the user's mental model:
+     *
+     *   First time we observe a runId (any status — queued / in_progress
+     *   / completed) we INSERT a new entry and bump `totalDeploys` so
+     *   the UI counter increments the moment a deploy *starts*.
+     *
+     *   Subsequent polls for the same runId UPDATE the existing entry's
+     *   status/conclusion/deployedUrl/failedStep/failedReason without
+     *   appending a duplicate row.
+     *
+     *   When status TRANSITIONS to terminal (completed with a non-null
+     *   conclusion) we increment `totalDeploysSuccess` or
+     *   `totalDeploysFailed` exactly once.
+     *
+     * Rollback markers continue to use the append-only `recordDeploy`
+     * above — they intentionally re-record the target runId with
+     * `rolledBackFrom` set, so we filter those out when matching here.
+     */
+    public DeployEntry upsertDeployFromPoll(McpProject p, AuditActor actor,
+                                            String runId, String runUrl,
+                                            String status, String conclusion,
+                                            String deployedUrl, Long durationMs,
+                                            String failedStep, String failedReason,
+                                            String commitSha) {
+        if (runId == null || runId.isBlank()) return null;
+        AuditTrail a = ensure(p);
+
+        // Find existing non-rollback entry for this runId.
+        DeployEntry existing = null;
+        for (DeployEntry de : a.getDeployHistory()) {
+            if (runId.equals(de.getRunId()) && de.getRolledBackFrom() == null) {
+                existing = de;
+                break;
+            }
+        }
+
+        boolean isTerminal = "completed".equalsIgnoreCase(status)
+                && conclusion != null && !conclusion.isBlank();
+
+        if (existing == null) {
+            // First sighting → INSERT. Counter +1 for the started run.
+            DeployEntry e = DeployEntry.builder().by(actor)
+                    .runId(runId).runUrl(runUrl)
+                    .status(status).conclusion(conclusion)
+                    .deployedUrl(deployedUrl).durationMs(durationMs)
+                    .failedStep(failedStep).failedReason(failedReason)
+                    .commitSha(commitSha)
+                    .build();
+            a.getDeployHistory().add(e);
+            a.setTotalDeploys(a.getDeployHistory().size());
+            // If we somehow saw a terminal status on first sighting
+            // (race where polling caught the very end), still credit
+            // the success/failed bucket so totals stay consistent.
+            if (isTerminal) bumpTerminalCounter(a, conclusion);
+            a.setLastUpdatedBy(actor);
+            return e;
+        }
+
+        // Existing entry → UPDATE. Bump success/failed counter ONLY
+        // when we just transitioned from non-terminal to terminal.
+        boolean wasTerminal = "completed".equalsIgnoreCase(existing.getStatus())
+                && existing.getConclusion() != null && !existing.getConclusion().isBlank();
+
+        existing.setRunUrl(runUrl != null ? runUrl : existing.getRunUrl());
+        existing.setStatus(status != null ? status : existing.getStatus());
+        if (conclusion != null && !conclusion.isBlank()) existing.setConclusion(conclusion);
+        if (deployedUrl != null && !deployedUrl.isBlank()) existing.setDeployedUrl(deployedUrl);
+        if (durationMs != null)   existing.setDurationMs(durationMs);
+        if (failedStep != null)   existing.setFailedStep(failedStep);
+        if (failedReason != null) existing.setFailedReason(failedReason);
+        if (commitSha != null && !commitSha.isBlank()) existing.setCommitSha(commitSha);
+
+        if (!wasTerminal && isTerminal) bumpTerminalCounter(a, conclusion);
+        a.setLastUpdatedBy(actor);
+        return existing;
+    }
+
+    private void bumpTerminalCounter(AuditTrail a, String conclusion) {
+        if ("success".equalsIgnoreCase(conclusion)) {
+            a.setTotalDeploysSuccess(a.getTotalDeploysSuccess() + 1);
+        } else {
+            // Any non-success terminal conclusion counts as failed
+            // (failure / cancelled / timed_out / action_required / etc).
+            a.setTotalDeploysFailed(a.getTotalDeploysFailed() + 1);
+        }
+    }
+
     /** Persist & return for caller chaining. */
     public McpProject save(McpProject p) { return repo.save(p); }
 }
