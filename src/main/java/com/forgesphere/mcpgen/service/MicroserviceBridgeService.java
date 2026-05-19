@@ -209,10 +209,19 @@ public class MicroserviceBridgeService {
      */
     public Map<String, Object> pushToGitHub(McpProject project) {
         McpProject p = project;
-        if (p.getGenerated() == null
+        // ALWAYS regenerate before push so any backend-template fix
+        // (workflow YAML / Dockerfile / package.json) lands in the
+        // pushed code. Without this, edits made through the wizard
+        // wouldn't reach the repo because the McpProject.generated.files
+        // cache pre-dates them. Idempotent — `generate(id)` overwrites
+        // the cached zip.
+        if (p.getId() != null) {
+            log.info("[push] regenerating files before push project={}", p.getId());
+            p = genSvc.generate(p.getId());
+        } else if (p.getGenerated() == null
                 || p.getGenerated().getFiles() == null
                 || p.getGenerated().getFiles().isEmpty()) {
-            log.info("[push] project={} has no generated files - running generator", p.getId());
+            log.info("[push] project has no id + no files - running inline generator");
             p = genSvc.generate(p.getId());
         }
         final McpProject mcp = p;

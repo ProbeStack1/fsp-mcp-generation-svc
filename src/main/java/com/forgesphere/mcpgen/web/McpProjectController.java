@@ -277,9 +277,53 @@ public class McpProjectController {
                 boolean already = trail.getDeployHistory().stream()
                         .anyMatch(e -> runId.equals(e.getRunId()) && "completed".equalsIgnoreCase(e.getStatus()));
                 if (!already) {
+                    // ── Failure attribution ──────────────────────────────
+                    // When the run failed we pull the per-step matrix and
+                    // identify the first step whose conclusion is failure /
+                    // cancelled / timed_out. That step's name becomes
+                    // `failedStep` and a one-line summary becomes
+                    // `failedReason` — so the catalog & wizard history
+                    // rows can show *why* a deploy failed without the user
+                    // having to click into GitHub Actions.
+                    String failedStep   = null;
+                    String failedReason = null;
+                    if (conclusion != null && !"success".equalsIgnoreCase(conclusion)) {
+                        try {
+                            Map<String, Object> steps = bridgeSvc.getWorkflowRunSteps(fresh, runId);
+                            @SuppressWarnings("unchecked")
+                            java.util.List<Map<String, Object>> jobs =
+                                    (java.util.List<Map<String, Object>>) steps.getOrDefault("jobs", java.util.List.of());
+                            outer:
+                            for (Map<String, Object> job : jobs) {
+                                @SuppressWarnings("unchecked")
+                                java.util.List<Map<String, Object>> sList =
+                                        (java.util.List<Map<String, Object>>) job.getOrDefault("steps", java.util.List.of());
+                                for (Map<String, Object> step : sList) {
+                                    String sConcl = String.valueOf(step.getOrDefault("conclusion", ""));
+                                    if ("failure".equalsIgnoreCase(sConcl)
+                                            || "cancelled".equalsIgnoreCase(sConcl)
+                                            || "timed_out".equalsIgnoreCase(sConcl)) {
+                                        failedStep   = String.valueOf(step.getOrDefault("name", "(unknown)"));
+                                        failedReason = "Step \"" + failedStep + "\" reported "
+                                                + sConcl.toLowerCase()
+                                                + " in job \"" + job.getOrDefault("name", "?") + "\". "
+                                                + "Open the workflow run on GitHub for the full byte-by-byte log.";
+                                        break outer;
+                                    }
+                                }
+                            }
+                        } catch (Exception ignore) {
+                            // Best-effort — keep recording the deploy even
+                            // if step lookup fails.
+                        }
+                        if (failedStep == null) {
+                            failedStep   = "deploy-to-cloud-run";
+                            failedReason = "Workflow concluded \"" + conclusion + "\". Open the run on GitHub for details.";
+                        }
+                    }
                     audit.recordDeploy(fresh, actorFromBody(fresh.getUpdatedBy(), fresh),
                             runId, runUrl, status, conclusion, deployed, null,
-                            null, null, null, fresh.getPushedCommitSha());
+                            failedStep, failedReason, null, fresh.getPushedCommitSha());
                     audit.save(fresh);
                 }
             }

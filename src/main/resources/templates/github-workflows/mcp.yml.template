@@ -149,17 +149,28 @@ ${langSteps}
         run: |
           SERVICE_URL='${{ steps.svcurl.outputs.service_url }}'
           echo "Probing ${SERVICE_URL}${HEALTH_PATH}"
-          sleep 12
-          for attempt in 1 2 3 4 5; do
-            if curl -fs "${SERVICE_URL}${HEALTH_PATH}"; then
+          # Cold-start budget: Cloud Run can take 20-40s to warm a fresh
+          # revision, especially for Java/Spring images. The earlier
+          # 12s + 5×8s budget (~52s total) was tripping false failures
+          # on first-time deploys even though /healthz was reachable
+          # seconds later. Bumped to 20s warm-up + 10×10s retries
+          # (~120s total) — well within Cloud Run's 300s request
+          # timeout and large enough to cover real cold starts.
+          sleep 20
+          for attempt in 1 2 3 4 5 6 7 8 9 10; do
+            if curl -fsS --max-time 10 "${SERVICE_URL}${HEALTH_PATH}"; then
               echo ""
               echo "Health check passed on attempt ${attempt}"
               exit 0
             fi
-            echo "Attempt ${attempt} failed, retrying in 8s..."
-            sleep 8
+            echo "Attempt ${attempt} failed, retrying in 10s..."
+            sleep 10
           done
-          echo "Health check failed after 5 attempts"
+          echo "Health check failed after 10 attempts (~120s)."
+          echo "The deploy itself succeeded — Cloud Run is serving the new revision —"
+          echo "but the /healthz endpoint did not return 2xx within the timeout."
+          echo "Inspect the service logs:"
+          echo "  gcloud run services logs read ${{ env.SERVICE_NAME }} --region=${{ env.REGION }} --limit=200"
           exit 1
 
       # ──────────────── Surface the deployed URL prominently ─────────────
