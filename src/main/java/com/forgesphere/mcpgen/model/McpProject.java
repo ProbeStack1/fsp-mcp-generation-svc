@@ -85,6 +85,24 @@ public class McpProject {
     private Instant updatedAt;
     private Instant lastDownloadedAt;     // set when the zip is fetched
 
+    /**
+     * Top-level audit identifiers — same shape Microservice / Proxy /
+     * Onboarding docs already store. Frontend pushes the user's email
+     * via the request body (per `onboardingService.js#withCreateAudit`)
+     * and the catalog table reads from these exact fields so the
+     * "Created By / Updated By" columns stay uniform across the platform.
+     */
+    private String createdBy;
+    private String updatedBy;
+
+    /**
+     * Detailed activity log — our own structured feed for the in-wizard
+     * "Deploy history" + "Activity timeline" panels. Senior's docs
+     * don't need this; it lives alongside the top-level strings so we
+     * never break their existing readers.
+     */
+    private AuditTrail auditTrail;
+
     /** "private" (default — only the creator sees this in the MCP Test Studio
      *  "My MCPs" filter) or "public" (every workspace user sees it). Auto-derived
      *  from auth selection: `auth.kind == 'none'` ⇒ public, else private. */
@@ -269,5 +287,67 @@ public class McpProject {
         private String content;         // UTF-8
         private int bytes;
         private String mimeHint;        // for syntax highlighting on the FE
+    }
+
+    // ─────────── Audit / activity ────────────────────────────────────────
+    /**
+     * Single actor stamp used inside edit/push/deploy entries. Carries the
+     * user's email (matching the `userEmail` localStorage key used by the
+     * senior team's onboarding / microservice services), a display name
+     * when available, and the UTC timestamp the action was performed.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class AuditActor {
+        private String email;       // = `createdBy` / `updatedBy` top-level
+        private String name;        // optional display name
+        private Instant timestamp;  // UTC
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class EditEntry {
+        private AuditActor by;
+        @Builder.Default private List<String> fieldsChanged = List.of();
+        private String note;        // human readable summary
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class PushEntry {
+        private AuditActor by;
+        private String repoFullName;
+        private String repoUrl;
+        private String branch;
+        private String commitSha;
+        private Integer fileCount;
+        private String status;      // success | failed
+        private String errorMessage;
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class DeployEntry {
+        private AuditActor by;
+        private String runId;
+        private String runUrl;
+        private String status;      // queued | in_progress | completed
+        private String conclusion;  // success | failure | cancelled | null
+        private String deployedUrl;
+        private Long   durationMs;
+        private String failedStep;      // name of the first failing step
+        private String failedReason;    // log excerpt for that step
+        private String rolledBackFrom;  // runId we rolled back from (if any)
+        private String commitSha;       // pushedCommitSha at time of deploy
+    }
+
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class AuditTrail {
+        private AuditActor createdBy;
+        private AuditActor lastUpdatedBy;
+        @Builder.Default private List<EditEntry>   editHistory   = new java.util.ArrayList<>();
+        @Builder.Default private List<PushEntry>   pushHistory   = new java.util.ArrayList<>();
+        @Builder.Default private List<DeployEntry> deployHistory = new java.util.ArrayList<>();
+        @Builder.Default private Integer totalEdits          = 0;
+        @Builder.Default private Integer totalPushes         = 0;
+        @Builder.Default private Integer totalDeploys        = 0;
+        @Builder.Default private Integer totalDeploysSuccess = 0;
+        @Builder.Default private Integer totalDeploysFailed  = 0;
     }
 }

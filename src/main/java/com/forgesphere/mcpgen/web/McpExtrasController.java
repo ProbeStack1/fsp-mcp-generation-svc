@@ -34,6 +34,30 @@ public class McpExtrasController {
         catch (Exception e) { return Envelope.fail(e.getMessage()); }
     }
 
+    // ---------------- AI batch capability synthesis ----------------
+    /**
+     * User describes the whole MCP server in 1-2 sentences and picks
+     * how many tools / resources / prompts they want generated. Each
+     * count is clamped to 0..10 server-side. Front-end's
+     * `AISynthesizeToolModal` calls this when the user toggles batch
+     * mode and selects the per-capability checkboxes + quantity.
+     */
+    public record SynthesiseCapsReq(String description,
+                                    Integer toolCount,
+                                    Integer resourceCount,
+                                    Integer promptCount) {}
+
+    @PostMapping("/ai/synthesize-capabilities")
+    public Envelope<Object> synthesizeCapabilities(@RequestBody SynthesiseCapsReq req) {
+        if (req == null || req.description() == null || req.description().isBlank())
+            return Envelope.fail("description is required");
+        int t = req.toolCount()     == null ? 3 : req.toolCount();
+        int r = req.resourceCount() == null ? 0 : req.resourceCount();
+        int p = req.promptCount()   == null ? 0 : req.promptCount();
+        try { return Envelope.ok(ai.synthesiseCapabilities(req.description(), t, r, p)); }
+        catch (Exception e) { return Envelope.fail(e.getMessage()); }
+    }
+
     // ---------------- Universal parser ----------------
     public record ParseReq(String raw) {}
 

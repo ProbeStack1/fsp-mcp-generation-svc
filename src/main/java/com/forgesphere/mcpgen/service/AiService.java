@@ -104,4 +104,96 @@ public class AiService {
         if (!parsed.containsKey("inputSchema"))  parsed.put("inputSchema", Map.of("type", "object", "properties", Map.of(), "required", List.of()));
         return parsed;
     }
+
+    /**
+     * Multi-capability batch synthesis — the user describes the whole MCP
+     * server in one sentence and selects how many tools / resources /
+     * prompts they want generated. Returns a single map keyed by
+     * {@code tools}, {@code resources}, {@code prompts} (each a list).
+     *
+     * Each requested count must be in 0..10. We cap at 10 so the prompt
+     * stays focused — bigger servers should be authored via the OpenAPI
+     * importer, not the AI brainstorm path.
+     */
+    public Map<String, Object> synthesiseCapabilities(String userDescription,
+                                                      int toolCount,
+                                                      int resourceCount,
+                                                      int promptCount) throws Exception {
+        int tn = Math.max(0, Math.min(10, toolCount));
+        int rn = Math.max(0, Math.min(10, resourceCount));
+        int pn = Math.max(0, Math.min(10, promptCount));
+        if (tn + rn + pn == 0) {
+            return Map.of("tools", List.of(), "resources", List.of(), "prompts", List.of());
+        }
+
+        String prompt = """
+                You are an expert at designing MCP (Model Context Protocol) servers.
+                Given a one-sentence description of a server, propose a coherent set of capabilities.
+
+                Produce ONE JSON object with exactly these top-level keys: "tools", "resources", "prompts".
+                Each is an array. Generate:
+                  - %d tools
+                  - %d resources
+                  - %d prompts
+
+                Rules per tool:
+                  - name: snake_case, 2-60 chars.
+                  - description: one short sentence.
+                  - inputSchema: valid JSON Schema (type:object, properties:{...}, required:[...]).
+                  - outputType: one of structured-json | text | markdown | image.
+                  - sideEffects: one of read-only | writes | destructive.
+                  - implementationHint: 1-3 lines of pseudo-code.
+
+                Rules per resource:
+                  - name: short kebab-case label.
+                  - uriTemplate: e.g. "repo://{owner}/{name}/issues".
+                  - description: one sentence.
+                  - mimeType: application/json | text/plain | text/markdown.
+                  - mode: static | dynamic.
+
+                Rules per prompt:
+                  - name: snake_case.
+                  - description: one sentence.
+                  - arguments: array of { name, description, required:boolean }.
+                  - template: markdown body with {{placeholders}} matching arguments.
+
+                Return ONLY the JSON object — no markdown fences, no commentary.
+
+                Server description: """.formatted(tn, rn, pn) + userDescription;
+
+        Map<String, Object> body = Map.of(
+                "contents", List.of(Map.of("parts", List.of(Map.of("text", prompt)))),
+                "generationConfig", Map.of(
+                        "temperature", 0.4,
+                        "responseMimeType", "application/json"));
+
+        String path = String.format("/models/%s:generateContent?key=%s", model, apiKey);
+        String raw  = wc.post().uri(path)
+                .bodyValue(body)
+                .retrieve()
+                .bodyToMono(String.class)
+                .timeout(Duration.ofSeconds(45))
+                .block();
+
+        JsonNode root = om.readTree(raw == null ? "{}" : raw);
+        JsonNode err  = root.path("error");
+        if (!err.isMissingNode()) throw new RuntimeException("Gemini: " + err.path("message").asText("error"));
+        String text = root.path("candidates").path(0).path("content").path("parts").path(0).path("text").asText("");
+        if (text.isBlank()) throw new RuntimeException("Gemini returned an empty response.");
+        text = text.trim();
+        if (text.startsWith("```")) {
+            int nl = text.indexOf('\n');
+            int en = text.lastIndexOf("```");
+            if (nl >= 0 && en > nl) text = text.substring(nl + 1, en).trim();
+        }
+        Map<String, Object> parsed;
+        try { parsed = om.readValue(text, Map.class); }
+        catch (Exception e) { throw new RuntimeException("Gemini returned non-JSON: " + text.substring(0, Math.min(text.length(), 200))); }
+
+        // Defensive defaults so the FE never has to null-guard.
+        parsed.putIfAbsent("tools",     List.of());
+        parsed.putIfAbsent("resources", List.of());
+        parsed.putIfAbsent("prompts",   List.of());
+        return parsed;
+    }
 }

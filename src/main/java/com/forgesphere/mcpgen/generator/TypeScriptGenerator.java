@@ -64,6 +64,15 @@ public class TypeScriptGenerator implements CodeGenerator {
         devDeps.put("tsx", "^4.7.0");
         devDeps.put("@types/node", "^20.11.0");
         if (t != null && !"stdio".equals(t.getKind())) devDeps.put("@types/express", "^4.17.21");
+        // Vitest is mandatory whenever we emit a `tests/tools.test.ts` —
+        // without it `npm test` blows up with "vitest: command not found"
+        // before any test even runs, which derails the CI gate on the
+        // first push. Only add the dep when we're actually going to ship
+        // a test file (i.e. caps has at least one tool).
+        if (caps != null && !caps.getTools().isEmpty()) {
+            devDeps.put("vitest", "^1.6.0");
+            scripts.put("test", "vitest run");
+        }
         pkg.put("devDependencies", devDeps);
         files.add(file("package.json", GeneratorUtils.pretty(pkg), "json"));
 

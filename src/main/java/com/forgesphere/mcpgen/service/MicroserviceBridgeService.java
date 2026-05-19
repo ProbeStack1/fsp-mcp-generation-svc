@@ -258,23 +258,57 @@ public class MicroserviceBridgeService {
         // 404 — same heuristic the GitHub CLI uses.
         ensureRepoExists(orgOrUser, repo, branch, token, scm);
 
-        // ─── Push each file via the Contents API ────────────────────
+        // ─── Push ALL files in a SINGLE commit (one workflow run) ───
+        // Per-file `PUT /contents/{path}` creates one commit per file, which
+        // means a fresh project with 10 files triggers 10 GitHub Actions
+        // runs (one per push). Switch to the Git Data API so all files
+        // land in ONE atomic commit → ONE workflow run, regardless of
+        // file count.
+        //
+        // Strategy:
+        //   1. resolve the branch head SHA (repo is guaranteed to exist
+        //      with an init commit thanks to `ensureRepoExists` above)
+        //   2. POST /git/blobs for every file body (base64)
+        //   3. POST /git/trees with base_tree=headSha + entries pointing
+        //      at the new blobs
+        //   4. POST /git/commits referencing the new tree + parent=head
+        //   5. PATCH /git/refs/heads/{branch} → fast-forward to new commit
+        //
+        // Falls back to per-file PUT only if a step in the batched flow
+        // hits an unrecoverable error (network, 5xx, etc.) so the demo
+        // never silently fails.
         java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
         java.util.List<Map<String, Object>> pushedFiles = new java.util.ArrayList<>();
         java.util.List<Map<String, Object>> failedFiles = new java.util.ArrayList<>();
         String commitMessage = "Push from ForgeSphere MCP wizard";
-        for (var gf : mcp.getGenerated().getFiles()) {
-            String path = gf.getPath();
-            String content = gf.getContent() == null ? "" : gf.getContent();
-            try {
-                Map<String, Object> ok = putFile(http, orgOrUser, repo, branch, path, content, token, commitMessage);
+        String headCommitSha = null;
+        try {
+            headCommitSha = pushAllFilesInOneCommit(http, orgOrUser, repo, branch,
+                    mcp.getGenerated().getFiles(), token, commitMessage);
+            for (var gf : mcp.getGenerated().getFiles()) {
+                Map<String, Object> ok = new LinkedHashMap<>();
+                ok.put("path", gf.getPath());
+                ok.put("status", 201);
                 pushedFiles.add(ok);
-            } catch (Exception e) {
-                log.warn("[push] {} → {} FAILED: {}", path, repo, e.getMessage());
-                Map<String, Object> err = new LinkedHashMap<>();
-                err.put("path", path);
-                err.put("error", e.getMessage());
-                failedFiles.add(err);
+            }
+            log.info("[push] batched commit succeeded: {} files in 1 commit (sha={})",
+                    pushedFiles.size(), headCommitSha);
+        } catch (Exception batchEx) {
+            log.warn("[push] batched commit failed — falling back to per-file PUT: {}", batchEx.getMessage());
+            pushedFiles.clear();
+            for (var gf : mcp.getGenerated().getFiles()) {
+                String path = gf.getPath();
+                String content = gf.getContent() == null ? "" : gf.getContent();
+                try {
+                    Map<String, Object> ok = putFile(http, orgOrUser, repo, branch, path, content, token, commitMessage);
+                    pushedFiles.add(ok);
+                } catch (Exception e) {
+                    log.warn("[push] {} → {} FAILED: {}", path, repo, e.getMessage());
+                    Map<String, Object> err = new LinkedHashMap<>();
+                    err.put("path", path);
+                    err.put("error", e.getMessage());
+                    failedFiles.add(err);
+                }
             }
         }
 
@@ -285,6 +319,9 @@ public class MicroserviceBridgeService {
         mcp.setPushedBranch(branch);
         mcp.setPushedFileCount(pushedFiles.size());
         mcp.setPushedAt(Instant.now());
+        if (headCommitSha != null && !headCommitSha.isBlank()) {
+            mcp.setPushedCommitSha(headCommitSha);
+        }
         if (mcp.getId() != null) projects.save(mcp);
 
         Map<String, Object> out = new LinkedHashMap<>();
@@ -295,9 +332,134 @@ public class MicroserviceBridgeService {
         out.put("failedCount",  failedFiles.size());
         out.put("pushedFiles",  pushedFiles);
         out.put("failedFiles",  failedFiles);
+        if (headCommitSha != null) out.put("commitSha", headCommitSha);
         log.info("[push] done project={} pushed={} failed={}",
                 mcp.getId(), pushedFiles.size(), failedFiles.size());
         return out;
+    }
+
+    /**
+     * Push every generated file in a SINGLE atomic commit using GitHub's
+     * Git Data API. Returns the new commit SHA on success or throws on
+     * the first unrecoverable error so the caller can fall back to the
+     * legacy per-file PUT path.
+     *
+     * Wire sequence (all calls go to api.github.com with the connector token):
+     *   1. GET  /repos/{o}/{r}/git/ref/heads/{branch}      — current ref
+     *   2. POST /repos/{o}/{r}/git/blobs                   — once per file
+     *   3. POST /repos/{o}/{r}/git/trees                   — one tree, base_tree=headSha
+     *   4. POST /repos/{o}/{r}/git/commits                 — one commit
+     *   5. PATCH /repos/{o}/{r}/git/refs/heads/{branch}    — fast-forward
+     */
+    private String pushAllFilesInOneCommit(java.net.http.HttpClient http,
+                                           String orgOrUser, String repo, String branch,
+                                           java.util.List<McpProject.GeneratedFile> files,
+                                           String token, String commitMessage) throws Exception {
+        String apiRoot = "https://api.github.com/repos/" + orgOrUser + "/" + repo;
+
+        // (1) current head — repo was already initialised by ensureRepoExists()
+        var refReq = java.net.http.HttpRequest.newBuilder(
+                java.net.URI.create(apiRoot + "/git/ref/heads/" + branch))
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/vnd.github+json")
+                .GET().build();
+        var refResp = http.send(refReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (refResp.statusCode() != 200) {
+            throw new IllegalStateException("git/ref/heads/" + branch + " returned " + refResp.statusCode() + ": " + refResp.body());
+        }
+        String headSha = extractFirstJsonString(refResp.body(), "\"sha\":\"");
+        if (headSha == null) throw new IllegalStateException("Could not parse head SHA from ref response");
+
+        // (2) one blob per file
+        java.util.List<String[]> blobs = new java.util.ArrayList<>(); // [path, blobSha]
+        for (var gf : files) {
+            String content = gf.getContent() == null ? "" : gf.getContent();
+            String b64 = java.util.Base64.getEncoder().encodeToString(
+                    content.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            String blobBody = "{\"content\":\"" + b64 + "\",\"encoding\":\"base64\"}";
+            var blobReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(apiRoot + "/git/blobs"))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString(blobBody))
+                    .build();
+            var blobResp = http.send(blobReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (blobResp.statusCode() != 201 && blobResp.statusCode() != 200) {
+                throw new IllegalStateException("git/blobs failed for " + gf.getPath() + ": "
+                        + blobResp.statusCode() + " " + blobResp.body());
+            }
+            String blobSha = extractFirstJsonString(blobResp.body(), "\"sha\":\"");
+            if (blobSha == null) throw new IllegalStateException("blob sha missing for " + gf.getPath());
+            blobs.add(new String[]{ gf.getPath(), blobSha });
+        }
+
+        // (3) tree referencing every blob, layered on top of current head
+        StringBuilder tree = new StringBuilder("{\"base_tree\":\"")
+                .append(headSha).append("\",\"tree\":[");
+        for (int i = 0; i < blobs.size(); i++) {
+            if (i > 0) tree.append(",");
+            tree.append("{\"path\":\"").append(escapeJson(blobs.get(i)[0]))
+                .append("\",\"mode\":\"100644\",\"type\":\"blob\",\"sha\":\"")
+                .append(blobs.get(i)[1]).append("\"}");
+        }
+        tree.append("]}");
+        var treeReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(apiRoot + "/git/trees"))
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/vnd.github+json")
+                .header("Content-Type", "application/json")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(tree.toString()))
+                .build();
+        var treeResp = http.send(treeReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (treeResp.statusCode() != 201 && treeResp.statusCode() != 200) {
+            throw new IllegalStateException("git/trees failed: " + treeResp.statusCode() + " " + treeResp.body());
+        }
+        String newTreeSha = extractFirstJsonString(treeResp.body(), "\"sha\":\"");
+        if (newTreeSha == null) throw new IllegalStateException("tree sha missing");
+
+        // (4) commit pointing at the new tree, parent = current head
+        String commitBody = "{\"message\":\"" + escapeJson(commitMessage) + "\","
+                + "\"tree\":\"" + newTreeSha + "\","
+                + "\"parents\":[\"" + headSha + "\"]}";
+        var commitReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(apiRoot + "/git/commits"))
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/vnd.github+json")
+                .header("Content-Type", "application/json")
+                .POST(java.net.http.HttpRequest.BodyPublishers.ofString(commitBody))
+                .build();
+        var commitResp = http.send(commitReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (commitResp.statusCode() != 201 && commitResp.statusCode() != 200) {
+            throw new IllegalStateException("git/commits failed: " + commitResp.statusCode() + " " + commitResp.body());
+        }
+        String newCommitSha = extractFirstJsonString(commitResp.body(), "\"sha\":\"");
+        if (newCommitSha == null) throw new IllegalStateException("commit sha missing");
+
+        // (5) fast-forward the ref to our new commit
+        String patchBody = "{\"sha\":\"" + newCommitSha + "\"}";
+        var patchReq = java.net.http.HttpRequest.newBuilder(
+                java.net.URI.create(apiRoot + "/git/refs/heads/" + branch))
+                .header("Authorization", "Bearer " + token)
+                .header("Accept", "application/vnd.github+json")
+                .header("Content-Type", "application/json")
+                .method("PATCH", java.net.http.HttpRequest.BodyPublishers.ofString(patchBody))
+                .build();
+        var patchResp = http.send(patchReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (patchResp.statusCode() != 200) {
+            throw new IllegalStateException("git/refs PATCH failed: " + patchResp.statusCode() + " " + patchResp.body());
+        }
+        return newCommitSha;
+    }
+
+    /** Find the value of the FIRST occurrence of {@code "key":"…"} in a
+     *  JSON blob. Good enough for the handful of GitHub Data API fields
+     *  we read here (sha, ref) without dragging in a JSON parser. */
+    private static String extractFirstJsonString(String body, String needle) {
+        if (body == null) return null;
+        int idx = body.indexOf(needle);
+        if (idx < 0) return null;
+        int start = idx + needle.length();
+        int end = body.indexOf('"', start);
+        if (end < start) return null;
+        return body.substring(start, end);
     }
 
     /**

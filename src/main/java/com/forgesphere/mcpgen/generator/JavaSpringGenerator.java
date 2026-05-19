@@ -35,6 +35,14 @@ public class JavaSpringGenerator implements CodeGenerator {
         String pkgLeaf  = artifact.replace("-", "").toLowerCase();
         String pkg      = groupId + "." + pkgLeaf;
         String displayName = id == null ? "mcp-server" : id.getDisplayName();
+        // Fall back to the slug when no explicit displayName was sent by
+        // the wizard — keeps the JavaSpring path from NPE-ing on payloads
+        // where only the bare identity fields are populated (the FE
+        // optionally surfaces displayName, not always).
+        if (displayName == null || displayName.isBlank()) {
+            displayName = (id != null && id.getSlug() != null && !id.getSlug().isBlank())
+                    ? id.getSlug() : "mcp-server";
+        }
         String displayQuoted = "\"" + displayName.replace("\"", "\\\"") + "\"";
 
         List<GeneratedFile> files = new ArrayList<>();
