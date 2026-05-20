@@ -5,6 +5,7 @@ import lombok.Builder;
 import lombok.Data;
 import lombok.NoArgsConstructor;
 import org.springframework.data.annotation.Id;
+import org.springframework.data.annotation.Transient;
 import org.springframework.data.mongodb.core.index.Indexed;
 import org.springframework.data.mongodb.core.mapping.Document;
 
@@ -79,7 +80,16 @@ public class McpProject {
     private Auth        auth;
     private Advanced    advanced;
 
-    private Generated   generated;        // null until `generate` is called
+    /**
+     * In-memory only — explicitly NOT persisted to MongoDB. Generated source
+     * files can be tens of KBs per file × dozens of files per project, which
+     * was bloating the Mongo doc and burning Atlas storage. The canonical
+     * artifact lives in GCS (see {@code zipObjectPath} / {@code gcsArchivePath});
+     * any reader that needs the file list calls {@code McpGenerationService.generate(id)}
+     * which recomputes deterministically from the spec.
+     */
+    @Transient
+    private Generated   generated;        // null until `generate` is called; never written to Mongo
 
     @Indexed private Instant createdAt;
     private Instant updatedAt;
