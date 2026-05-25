@@ -1226,10 +1226,18 @@ public class MicroserviceBridgeService {
             }
             String jobSlice = body.substring(start, end);
             Map<String, Object> job = new java.util.LinkedHashMap<>();
+            // Forward identifying + outcome fields…
+            job.put("id",         extractLong  (jobSlice, "id"));
             job.put("name",       extractString(jobSlice, "name"));
             job.put("status",     extractString(jobSlice, "status"));
             job.put("conclusion", extractString(jobSlice, "conclusion"));
-            job.put("steps",      parseSteps(jobSlice));
+            // …plus GitHub-side timestamps + run link so the deployment
+            // status panel can render Duration / "Open" links per job.
+            // The senior endpoint exposes these as camelCase, so we mirror.
+            job.put("htmlUrl",     extractString(jobSlice, "html_url"));
+            job.put("startedAt",   extractString(jobSlice, "started_at"));
+            job.put("completedAt", extractString(jobSlice, "completed_at"));
+            job.put("steps",       parseSteps(jobSlice));
             jobs.add(job);
             cursor = end + 1;
             // Stop when we leave the jobs array (depth tracking is
@@ -1258,9 +1266,19 @@ public class MicroserviceBridgeService {
             }
             String stepSlice = jobSlice.substring(start, end);
             Map<String, Object> step = new java.util.LinkedHashMap<>();
-            step.put("name",       extractString(stepSlice, "name"));
-            step.put("status",     extractString(stepSlice, "status"));
-            step.put("conclusion", extractString(stepSlice, "conclusion"));
+            // GitHub returns `number` (int), `started_at`, `completed_at`
+            // per step. The frontend deployment status panel reads
+            // step.number (for grouping/highlighting),
+            // step.startedAt + step.completedAt (for the Duration cell
+            // and the "completed at" timestamp). Without these fields
+            // the panel correctly shows N/A — so we extract them all
+            // and mirror to camelCase to match the senior endpoint.
+            step.put("number",      extractLong  (stepSlice, "number"));
+            step.put("name",        extractString(stepSlice, "name"));
+            step.put("status",      extractString(stepSlice, "status"));
+            step.put("conclusion",  extractString(stepSlice, "conclusion"));
+            step.put("startedAt",   extractString(stepSlice, "started_at"));
+            step.put("completedAt", extractString(stepSlice, "completed_at"));
             steps.add(step);
             cursor = end + 1;
         }
