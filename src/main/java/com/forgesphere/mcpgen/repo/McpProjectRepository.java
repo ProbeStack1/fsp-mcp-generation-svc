@@ -7,9 +7,30 @@ import java.util.List;
 import java.util.Optional;
 
 public interface McpProjectRepository extends MongoRepository<McpProject, String> {
+
+    /* ----- default catalog reads (hide soft-deleted) ----- */
+
+    List<McpProject> findBySoftDeletedFalseOrderByCreatedAtDesc();
+
+    List<McpProject> findByOwnerEmailAndSoftDeletedFalseOrderByCreatedAtDesc(String ownerEmail);
+
+    List<McpProject> findByWorkspaceIdAndSoftDeletedFalseOrderByCreatedAtDesc(String workspaceId);
+
+    /* ----- legacy unfiltered reads (kept for back-compat) ----- */
+
     List<McpProject> findByOwnerEmailOrderByCreatedAtDesc(String ownerEmail);
     List<McpProject> findByWorkspaceIdOrderByCreatedAtDesc(String workspaceId);
+
+    /* ----- slug lookups ----- */
+
     Optional<McpProject> findByWorkspaceIdAndIdentitySlug(String workspaceId, String slug);
+
+    /**
+     * Find every project that shares the same slug within a workspace,
+     * regardless of soft-delete state. Used by the version endpoint to
+     * compute the next version number and prevent collisions.
+     */
+    List<McpProject> findByWorkspaceIdAndIdentitySlugOrderByCreatedAtDesc(String workspaceId, String slug);
 
     /**
      * Projects with a recorded `pushedCommitSha` are the only candidates

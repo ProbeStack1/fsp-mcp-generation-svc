@@ -8,6 +8,10 @@ import com.forgesphere.mcpgen.storage.StorageClient;
 import com.forgesphere.mcpgen.storage.StoredObject;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.data.mongodb.core.MongoTemplate;
+import org.springframework.data.mongodb.core.query.Criteria;
+import org.springframework.data.mongodb.core.query.Query;
+import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Service;
 
 import java.io.ByteArrayOutputStream;
@@ -30,6 +34,8 @@ public class McpGenerationService {
     private final McpProjectRepository repo;
     private final List<CodeGenerator> generators;
     private final StorageClient storage;
+    private final GenerationPostProcessor postProcessor;
+    private final MongoTemplate mongoTemplate;
 
     // ------------------------------------------------------------- CRUD
     public McpProject create(McpProject p) {
@@ -47,11 +53,28 @@ public class McpGenerationService {
     }
 
     public List<McpProject> list(String ownerEmail, String workspaceId) {
-        if (ownerEmail != null && !ownerEmail.isBlank())
-            return repo.findByOwnerEmailOrderByCreatedAtDesc(ownerEmail);
-        if (workspaceId != null && !workspaceId.isBlank())
-            return repo.findByWorkspaceIdOrderByCreatedAtDesc(workspaceId);
-        return repo.findAll();
+        return list(ownerEmail, workspaceId, false);
+    }
+
+    /**
+     * Catalog read with explicit control over whether soft-deleted projects
+     * should be included. The default ({@code includeDeleted = false}) is
+     * what the UI uses; admin trash views pass {@code true}.
+     */
+    public List<McpProject> list(String ownerEmail, String workspaceId, boolean includeDeleted) {
+        if (ownerEmail != null && !ownerEmail.isBlank()) {
+            return includeDeleted
+                    ? repo.findByOwnerEmailOrderByCreatedAtDesc(ownerEmail)
+                    : repo.findByOwnerEmailAndSoftDeletedFalseOrderByCreatedAtDesc(ownerEmail);
+        }
+        if (workspaceId != null && !workspaceId.isBlank()) {
+            return includeDeleted
+                    ? repo.findByWorkspaceIdOrderByCreatedAtDesc(workspaceId)
+                    : repo.findByWorkspaceIdAndSoftDeletedFalseOrderByCreatedAtDesc(workspaceId);
+        }
+        return includeDeleted
+                ? repo.findAll()
+                : repo.findBySoftDeletedFalseOrderByCreatedAtDesc();
     }
 
     public Optional<McpProject> get(String id) { return repo.findById(id); }
@@ -74,7 +97,277 @@ public class McpGenerationService {
         return repo.save(cur);
     }
 
+    /**
+     * Hard delete — wipes the document outright. Kept only for the
+     * legacy admin purge path; the wizard always uses {@link #softDelete}
+     * via the controller.
+     */
     public void delete(String id) { repo.deleteById(id); }
+
+    // ----------------------------------------------------- Lifecycle ops
+
+    /**
+     * Mark a project as deleted without removing the document. The catalog
+     * filters {@code softDeleted == true} out by default; admins can still
+     * see and restore the row via {@code includeDeleted = true} on list.
+     */
+    public McpProject softDelete(String id, McpProject.AuditActor actor, String reason) {
+        McpProject cur = mustGet(id);
+        cur.setSoftDeleted(true);
+        cur.setDeleteEvent(McpProject.DeleteEvent.builder()
+                .by(actor)
+                .reason(reason)
+                .build());
+        cur.setUpdatedAt(Instant.now());
+        if (actor != null && actor.getEmail() != null) cur.setUpdatedBy(actor.getEmail());
+        return repo.save(cur);
+    }
+
+    /**
+     * Inverse of {@link #softDelete}. Keeps the delete event in place so
+     * the audit timeline still shows the deletion, just stamps the
+     * restore actor/timestamp on the same event.
+     */
+    public McpProject restore(String id, McpProject.AuditActor actor) {
+        McpProject cur = mustGet(id);
+        if (!cur.isSoftDeleted()) return cur; // idempotent
+        cur.setSoftDeleted(false);
+        if (cur.getDeleteEvent() != null) {
+            cur.getDeleteEvent().setRestoredAt(Instant.now());
+            cur.getDeleteEvent().setRestoredBy(actor);
+        }
+        cur.setUpdatedAt(Instant.now());
+        if (actor != null && actor.getEmail() != null) cur.setUpdatedBy(actor.getEmail());
+        return repo.save(cur);
+    }
+
+    /**
+     * Flip the {@code deprecated} flag. The catalog still surfaces the
+     * project but ribbons it with a "deprecated" badge so new consumers
+     * know not to onboard against it.
+     */
+    public McpProject deprecate(String id, McpProject.AuditActor actor, String reason) {
+        McpProject cur = mustGet(id);
+        cur.setDeprecated(true);
+        cur.setDeprecatedAt(Instant.now());
+        cur.setDeprecatedBy(actor == null ? null : actor.getEmail());
+        cur.setDeprecationReason(reason);
+        cur.setUpdatedAt(Instant.now());
+        if (actor != null && actor.getEmail() != null) cur.setUpdatedBy(actor.getEmail());
+        return repo.save(cur);
+    }
+
+    public McpProject undeprecate(String id, McpProject.AuditActor actor) {
+        McpProject cur = mustGet(id);
+        cur.setDeprecated(false);
+        cur.setDeprecatedAt(null);
+        cur.setDeprecatedBy(null);
+        cur.setDeprecationReason(null);
+        cur.setUpdatedAt(Instant.now());
+        if (actor != null && actor.getEmail() != null) cur.setUpdatedBy(actor.getEmail());
+        return repo.save(cur);
+    }
+
+    /**
+     * Deep-copy of a project under a new id. Identity slug is suffixed
+     * with {@code -copy} (or the caller-supplied {@code newSlug}) to avoid
+     * collisions in the workspace. All generation artifacts are cleared
+     * so the clone starts at Step 1's "needs generate" state.
+     */
+    public McpProject clone(String id, McpProject.AuditActor actor, String newSlug) {
+        McpProject src = mustGet(id);
+        McpProject copy = deepCopy(src);
+        copy.setId(UUID.randomUUID().toString());
+        copy.setCloneOf(src.getId());
+        copy.setVersionOf(null);
+        copy.setVersionNumber(null);
+        copy.setSoftDeleted(false);
+        copy.setDeleteEvent(null);
+        copy.setDeprecated(false);
+        copy.setDeprecatedAt(null);
+        copy.setDeprecatedBy(null);
+        copy.setDeprecationReason(null);
+        // Reset everything that's tied to a specific push/deploy lifecycle.
+        copy.setMicroserviceMirrorId(null);
+        copy.setDeploymentArtifactId(null);
+        copy.setCodeGenResultId(null);
+        copy.setGcsArchivePath(null);
+        copy.setMirroredAt(null);
+        copy.setPushedRepoFullName(null);
+        copy.setPushedRepoUrl(null);
+        copy.setPushedBranch(null);
+        copy.setPushedCommitSha(null);
+        copy.setPushedActionsUrl(null);
+        copy.setPushedFileCount(null);
+        copy.setPushedAt(null);
+        copy.setLatestRunId(null);
+        copy.setLatestRunStatus(null);
+        copy.setLatestRunConclusion(null);
+        copy.setLatestRunUrl(null);
+        copy.setLatestRunCheckedAt(null);
+        copy.setDeployedServiceUrl(null);
+        copy.setDeployedAt(null);
+        copy.setZipObjectPath(null);
+        copy.setZipBytes(null);
+        copy.setZipContentType(null);
+        copy.setZipUploadedAt(null);
+        copy.setLastDownloadedAt(null);
+        copy.setStepCompletion(new java.util.ArrayList<>());
+        copy.setRunHistory(new java.util.ArrayList<>());
+        copy.setAuditTrail(null); // AuditService will lazy-init on first record
+        // Slug nudge so the clone doesn't collide with the original in the same workspace.
+        if (copy.getIdentity() != null) {
+            String slug = newSlug != null && !newSlug.isBlank()
+                    ? newSlug
+                    : safeSlug(copy.getIdentity().getSlug()) + "-copy";
+            copy.getIdentity().setSlug(slug);
+            if (copy.getIdentity().getDisplayName() != null) {
+                copy.getIdentity().setDisplayName(copy.getIdentity().getDisplayName() + " (Copy)");
+            }
+        }
+        Instant now = Instant.now();
+        copy.setCreatedAt(now);
+        copy.setUpdatedAt(now);
+        if (actor != null && actor.getEmail() != null) {
+            copy.setCreatedBy(actor.getEmail());
+            copy.setUpdatedBy(actor.getEmail());
+        }
+        return repo.save(copy);
+    }
+
+    /**
+     * Produce a new document representing a fresh semver of an existing
+     * project. Same slug/workspace; the {@code versionOf} pointer chains
+     * the new doc back to its predecessor so the catalog can render the
+     * version timeline.
+     */
+    public McpProject version(String id, McpProject.AuditActor actor, String newVersion) {
+        McpProject src = mustGet(id);
+        McpProject copy = deepCopy(src);
+        copy.setId(UUID.randomUUID().toString());
+        copy.setVersionOf(src.getId());
+        copy.setCloneOf(null);
+        copy.setVersionNumber(newVersion != null && !newVersion.isBlank()
+                ? newVersion
+                : nextSemver(src.getVersionNumber()));
+        // A new version starts fresh on the deploy lifecycle.
+        copy.setMicroserviceMirrorId(null);
+        copy.setDeploymentArtifactId(null);
+        copy.setCodeGenResultId(null);
+        copy.setGcsArchivePath(null);
+        copy.setMirroredAt(null);
+        copy.setPushedCommitSha(null);
+        copy.setPushedAt(null);
+        copy.setLatestRunId(null);
+        copy.setLatestRunStatus(null);
+        copy.setSoftDeleted(false);
+        copy.setDeleteEvent(null);
+        copy.setDeprecated(false);
+        copy.setDeprecatedAt(null);
+        copy.setDeprecatedBy(null);
+        copy.setStepCompletion(new java.util.ArrayList<>());
+        copy.setRunHistory(new java.util.ArrayList<>());
+        copy.setAuditTrail(null);
+        Instant now = Instant.now();
+        copy.setCreatedAt(now);
+        copy.setUpdatedAt(now);
+        if (actor != null && actor.getEmail() != null) {
+            copy.setCreatedBy(actor.getEmail());
+            copy.setUpdatedBy(actor.getEmail());
+        }
+        return repo.save(copy);
+    }
+
+    /**
+     * Append a {@link McpProject.StepCompletion} entry. The wizard calls
+     * this whenever a step transitions to "done" — the controller passes
+     * the actor stamped by the request body.
+     */
+    public McpProject markStepComplete(String id, int stepNumber, String stepName,
+                                       McpProject.AuditActor actor, String status, String note) {
+        McpProject cur = mustGet(id);
+        List<McpProject.StepCompletion> ledger = cur.getStepCompletion();
+        if (ledger == null) ledger = new java.util.ArrayList<>();
+        ledger.add(McpProject.StepCompletion.builder()
+                .stepNumber(stepNumber)
+                .stepName(stepName)
+                .completedBy(stampActor(actor))
+                .status(status == null ? "success" : status)
+                .note(note)
+                .build());
+        cur.setStepCompletion(ledger);
+        cur.setUpdatedAt(Instant.now());
+        if (actor != null && actor.getEmail() != null) cur.setUpdatedBy(actor.getEmail());
+        return repo.save(cur);
+    }
+
+    /**
+     * Record an execution row and trim the buffer. The 50-row cap keeps
+     * the Mongo document well under the 16 MB BSON limit even after years
+     * of activity.
+     */
+    public McpProject recordRun(String id, McpProject.RunEntry entry) {
+        McpProject cur = mustGet(id);
+        List<McpProject.RunEntry> hist = cur.getRunHistory();
+        if (hist == null) hist = new java.util.ArrayList<>();
+        if (entry.getBy() != null) entry.setBy(stampActor(entry.getBy()));
+        hist.add(0, entry);                                  // newest first
+        if (hist.size() > 50) hist = new java.util.ArrayList<>(hist.subList(0, 50));
+        cur.setRunHistory(hist);
+        cur.setUpdatedAt(Instant.now());
+        return repo.save(cur);
+    }
+
+    // ─────────── private helpers ────────────────────────────────────
+
+    private McpProject mustGet(String id) {
+        return repo.findById(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+    }
+
+    private static McpProject.AuditActor stampActor(McpProject.AuditActor a) {
+        if (a == null) return null;
+        if (a.getTimestamp() == null) a.setTimestamp(Instant.now());
+        return a;
+    }
+
+    private static String safeSlug(String s) {
+        if (s == null || s.isBlank()) return "mcp-server";
+        return s;
+    }
+
+    /**
+     * Best-effort semver bump: "1.2.3" → "1.2.4", missing → "1.0.0".
+     * The caller can override by passing an explicit value to
+     * {@link #version}.
+     */
+    private static String nextSemver(String prev) {
+        if (prev == null || prev.isBlank()) return "1.0.0";
+        String[] parts = prev.split("\\.");
+        if (parts.length != 3) return prev + ".1";
+        try {
+            int patch = Integer.parseInt(parts[2]);
+            return parts[0] + "." + parts[1] + "." + (patch + 1);
+        } catch (NumberFormatException e) {
+            return prev + ".1";
+        }
+    }
+
+    /**
+     * Mongo-aware deep copy: serialise to JSON via Jackson and read back.
+     * Beats hand-rolled Lombok copy because it handles every nested
+     * record automatically and silently drops the {@code @Transient}
+     * {@code generated} field.
+     */
+    private McpProject deepCopy(McpProject src) {
+        com.fasterxml.jackson.databind.ObjectMapper m = new com.fasterxml.jackson.databind.ObjectMapper()
+                .registerModule(new com.fasterxml.jackson.datatype.jsr310.JavaTimeModule());
+        try {
+            String json = m.writeValueAsString(src);
+            return m.readValue(json, McpProject.class);
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to deep-copy McpProject " + src.getId(), e);
+        }
+    }
 
     // --------------------------------------------------------- Generate
     public McpProject generate(String id) {
@@ -94,7 +387,12 @@ public class McpGenerationService {
                 .filter(g -> g.language().equalsIgnoreCase(lang))
                 .findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("unsupported language: " + lang));
-        var files = gen.generate(p);
+        var files = new ArrayList<>(gen.generate(p));
+        // Honour the user's Step 7 picks — strip test kinds they
+        // unchecked, add postman/inspector/Dockerfile/client configs
+        // they enabled. Has to run BEFORE we tally `totalBytes` so the
+        // catalog stat is accurate.
+        postProcessor.apply(p, files);
         int total = files.stream().mapToInt(f -> f.getBytes()).sum();
         p.setGenerated(Generated.builder()
                 .files(files).totalBytes(total).generatedAt(Instant.now()).build());
@@ -143,6 +441,16 @@ public class McpGenerationService {
                 }
                 p.setLastDownloadedAt(Instant.now());
                 repo.save(p);
+                // ──────────────────────────────────────────────────
+                // Mirror the GCS path into `codegen_results` so senior's
+                // contract-testing-svc / analysis-svc / peer-review-svc
+                // BundleDownloadService finds the MCP zip the same way
+                // it finds microservice zips (it queries `codegen_results`
+                // by microserviceId first, then falls back to api-dev).
+                // We keep the schema identical to the microservice
+                // pipeline so no senior-side change is needed.
+                // ──────────────────────────────────────────────────
+                mirrorIntoCodegenResults(p);
             } catch (Exception ex) {
                 log.warn("[zip] storage upload failed (continuing with stream-only): {}", ex.getMessage());
             }
@@ -170,6 +478,63 @@ public class McpGenerationService {
                 ? p.getIdentity().getSlug()
                 : "mcp-server";
         return slug.replaceAll("[^a-z0-9-]+", "-");
+    }
+
+    /**
+     * Upsert a record into {@code codegen_results} so senior's
+     * BundleDownloadService (analysis/contract-testing/peer-review)
+     * picks the MCP zip via the same query path it uses for
+     * microservice zips.
+     *
+     * Schema mirrors the microservice contract:
+     * <pre>
+     *   {
+     *     microserviceId : &lt;project.id (or mirror id when set)&gt;,
+     *     gcsArchivePath : "gs://bucket/path/to.zip"   (local fallback writes a file:// URI),
+     *     archiveFileName: "&lt;slug&gt;.zip",
+     *     targetType     : "MCP_SERVER",
+     *     updatedAt      : Instant
+     *   }
+     * </pre>
+     *
+     * We deliberately store under BOTH ids when a mirror id exists —
+     * senior's lookups use whatever id the UI sends, which may be
+     * either the MCP project id or the legacy microserviceMirrorId.
+     */
+    private void mirrorIntoCodegenResults(McpProject p) {
+        if (mongoTemplate == null || p.getZipObjectPath() == null) return;
+        try {
+            String gcsPath = p.getZipObjectPath();
+            // The storage abstraction stores either "gs://bucket/key" or
+            // a local fallback "file:///tmp/...". Senior's GCS-only
+            // downloader needs the gs:// form — if we're on local mode
+            // we still write the record so non-prod runs are visible
+            // in the catalog query; senior's parseGcsPath will surface
+            // a clear 400 instead of returning silent garbage.
+            String fileName = slugForZip(p) + ".zip";
+            Update u = new Update()
+                    .set("microserviceId",  p.getId())
+                    .set("gcsArchivePath",  gcsPath)
+                    .set("archiveFileName", fileName)
+                    .set("targetType",      "MCP_SERVER")
+                    .set("updatedAt",       Instant.now());
+            mongoTemplate.upsert(Query.query(Criteria.where("microserviceId").is(p.getId())),
+                    u, "codegen_results");
+            String mirror = p.getMicroserviceMirrorId();
+            if (mirror != null && !mirror.isBlank() && !mirror.equals(p.getId())) {
+                mongoTemplate.upsert(Query.query(Criteria.where("microserviceId").is(mirror)),
+                        new Update()
+                                .set("microserviceId",  mirror)
+                                .set("gcsArchivePath",  gcsPath)
+                                .set("archiveFileName", fileName)
+                                .set("targetType",      "MCP_SERVER")
+                                .set("updatedAt",       Instant.now()),
+                        "codegen_results");
+            }
+            log.info("[codegen_results] mirrored MCP {} → {}", p.getId(), gcsPath);
+        } catch (Exception ex) {
+            log.warn("[codegen_results] mirror failed: {}", ex.getMessage());
+        }
     }
 
     // --------------------------------------------------- Client configs

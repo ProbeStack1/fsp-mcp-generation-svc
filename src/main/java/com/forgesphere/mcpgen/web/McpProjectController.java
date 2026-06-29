@@ -5,10 +5,14 @@ import com.forgesphere.mcpgen.model.McpProject;
 import com.forgesphere.mcpgen.model.McpProject.AuditActor;
 import com.forgesphere.mcpgen.model.McpProject.DeployEntry;
 import com.forgesphere.mcpgen.service.AuditService;
+import com.forgesphere.mcpgen.service.McpBundleBuilder;
+import com.forgesphere.mcpgen.service.McpDesignValidator;
 import com.forgesphere.mcpgen.service.McpGenerationService;
 import com.forgesphere.mcpgen.service.McpProbeService;
+import com.forgesphere.mcpgen.service.McpToolSimulator;
 import com.forgesphere.mcpgen.service.MicroserviceBridgeService;
 import lombok.RequiredArgsConstructor;
+import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
@@ -54,6 +58,9 @@ public class McpProjectController {
     private final McpProbeService probeSvc;
     private final MicroserviceBridgeService bridgeSvc;
     private final AuditService audit;
+    private final McpDesignValidator designValidator;
+    private final McpToolSimulator toolSimulator;
+    private final McpBundleBuilder bundleBuilder;
 
     /** Pull caller identity from the project body (set by the frontend's
      *  `withCreateAudit` / `withUpdateAudit` helpers exactly as the senior
@@ -85,8 +92,9 @@ public class McpProjectController {
 
     @GetMapping
     public Envelope<List<McpProject>> list(@RequestParam(required = false) String ownerEmail,
-                                           @RequestParam(required = false) String workspaceId) {
-        return Envelope.ok(svc.list(ownerEmail, workspaceId));
+                                           @RequestParam(required = false) String workspaceId,
+                                           @RequestParam(required = false, defaultValue = "false") boolean includeDeleted) {
+        return Envelope.ok(svc.list(ownerEmail, workspaceId, includeDeleted));
     }
 
     @GetMapping("/{id}")
@@ -124,10 +132,179 @@ public class McpProjectController {
         return Envelope.ok(saved);
     }
 
+    /**
+     * Soft delete by default — the project disappears from the catalog
+     * but the document is preserved so it can be restored later. Pass
+     * {@code ?hard=true} for the legacy purge path used by the admin
+     * "trash" UI only.
+     */
     @DeleteMapping("/{id}")
-    public Envelope<Map<String, Object>> delete(@PathVariable String id) {
-        svc.delete(id);
-        return Envelope.ok(Map.of("deleted", id));
+    public Envelope<Map<String, Object>> delete(@PathVariable String id,
+                                                @RequestParam(required = false, defaultValue = "false") boolean hard,
+                                                @RequestParam(required = false) String reason,
+                                                @RequestParam(required = false) String actorEmail) {
+        if (hard) {
+            svc.delete(id);
+            return Envelope.ok(Map.of("deleted", id, "hard", true));
+        }
+        McpProject p = svc.softDelete(id, audit.actor(actorEmail, null), reason);
+        return Envelope.ok(Map.of(
+                "deleted",     id,
+                "softDeleted", true,
+                "deletedAt",   p.getDeleteEvent() == null ? null : p.getUpdatedAt()));
+    }
+
+    // ------------- Lifecycle (clone / version / deprecate / restore) -------------
+
+    /**
+     * Restore a soft-deleted project. Idempotent — calling on a live
+     * project is a no-op.
+     */
+    @PostMapping("/{id}/restore")
+    public Envelope<McpProject> restore(@PathVariable String id,
+                                        @RequestBody(required = false) Map<String, Object> body) {
+        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        return Envelope.ok(svc.restore(id, audit.actor(actorEmail, null)));
+    }
+
+    /**
+     * Deep-copy a project under a new id. Frontend uses this for the
+     * "Clone" button on the catalog. Optional {@code slug} in the body
+     * overrides the default {@code <original>-copy} suffix.
+     */
+    @PostMapping("/{id}/clone")
+    public Envelope<McpProject> clone(@PathVariable String id,
+                                      @RequestBody(required = false) Map<String, Object> body) {
+        String actorEmail = body == null ? null : (String) body.get("createdBy");
+        if ((actorEmail == null || actorEmail.isBlank()) && body != null) {
+            actorEmail = (String) body.get("updatedBy");
+        }
+        String newSlug = body == null ? null : (String) body.get("slug");
+        McpProject copy = svc.clone(id, audit.actor(actorEmail, null), newSlug);
+        audit.recordCreate(copy, audit.actor(actorEmail, null));
+        audit.save(copy);
+        return Envelope.ok(copy);
+    }
+
+    /**
+     * Create the next semver of an existing project. Optional
+     * {@code versionNumber} in the body overrides the auto-bump.
+     */
+    @PostMapping("/{id}/version")
+    public Envelope<McpProject> version(@PathVariable String id,
+                                        @RequestBody(required = false) Map<String, Object> body) {
+        String actorEmail = body == null ? null : (String) body.get("createdBy");
+        if ((actorEmail == null || actorEmail.isBlank()) && body != null) {
+            actorEmail = (String) body.get("updatedBy");
+        }
+        String newVersion = body == null ? null : (String) body.get("versionNumber");
+        McpProject copy = svc.version(id, audit.actor(actorEmail, null), newVersion);
+        audit.recordCreate(copy, audit.actor(actorEmail, null));
+        audit.save(copy);
+        return Envelope.ok(copy);
+    }
+
+    /** Flag the project as deprecated. Body: {@code {reason, updatedBy}}. */
+    @PostMapping("/{id}/deprecate")
+    public Envelope<McpProject> deprecate(@PathVariable String id,
+                                          @RequestBody(required = false) Map<String, Object> body) {
+        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        String reason     = body == null ? null : (String) body.get("reason");
+        return Envelope.ok(svc.deprecate(id, audit.actor(actorEmail, null), reason));
+    }
+
+    /** Reverse of {@link #deprecate}. */
+    @PostMapping("/{id}/undeprecate")
+    public Envelope<McpProject> undeprecate(@PathVariable String id,
+                                            @RequestBody(required = false) Map<String, Object> body) {
+        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        return Envelope.ok(svc.undeprecate(id, audit.actor(actorEmail, null)));
+    }
+
+    // ------------- Step completion tracking -------------
+
+    /**
+     * Stamp a wizard step as complete on the project. Body shape:
+     * <pre>{ stepName: "MCP Design", status: "success", note: "...", updatedBy: "x@y" }</pre>
+     */
+    @PostMapping("/{id}/steps/{stepNumber}/complete")
+    public Envelope<McpProject> markStepComplete(@PathVariable String id,
+                                                 @PathVariable int stepNumber,
+                                                 @RequestBody(required = false) Map<String, Object> body) {
+        String stepName   = body == null ? null : (String) body.get("stepName");
+        String status     = body == null ? "success" : String.valueOf(body.getOrDefault("status", "success"));
+        String note       = body == null ? null : (String) body.get("note");
+        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        return Envelope.ok(svc.markStepComplete(id, stepNumber, stepName,
+                audit.actor(actorEmail, null), status, note));
+    }
+
+    // ------------- Design validation (Step 4) -------------
+
+    /**
+     * Lint the MCP spec held on this project and return the issue list.
+     * The wizard's Step 4 calls this on entry and on every edit.
+     */
+    @PostMapping("/{id}/validate-design")
+    public Envelope<Map<String, Object>> validateDesign(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        return Envelope.ok(designValidator.validate(p).toJson());
+    }
+
+    // ------------- Tool simulator (Step 5, stdio transport) -------------
+
+    /**
+     * JSON-RPC stub for projects whose transport is {@code stdio} — the
+     * senior team's REST {@code mockApiService} doesn't apply. Body:
+     * <pre>{ toolName: "get_issue", arguments: { ... }, updatedBy: "x@y" }</pre>
+     * The call is recorded on {@code runHistory}.
+     */
+    @PostMapping("/{id}/simulate-tool")
+    public Envelope<Map<String, Object>> simulateTool(@PathVariable String id,
+                                                      @RequestBody Map<String, Object> body) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        String toolName = body == null ? null : (String) body.get("toolName");
+        @SuppressWarnings("unchecked")
+        Map<String, Object> args = body == null ? Map.of()
+                : (Map<String, Object>) body.getOrDefault("arguments", Map.of());
+        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+
+        long started = System.currentTimeMillis();
+        Map<String, Object> out = toolSimulator.simulate(p, toolName, args);
+        long durationMs = System.currentTimeMillis() - started;
+
+        // Record on runHistory so the audit timeline shows the call.
+        boolean ok = out.get("error") == null;
+        svc.recordRun(id, McpProject.RunEntry.builder()
+                .by(audit.actor(actorEmail, null))
+                .kind("tool-simulate")
+                .target(toolName)
+                .status(ok ? "success" : "failed")
+                .durationMs(durationMs)
+                .resultSummary(ok ? "Simulated tool call returned a response."
+                        : "Simulated tool call returned an error.")
+                .build());
+        return Envelope.ok(out);
+    }
+
+    // ------------- Bundle download (Step 11) -------------
+
+    /**
+     * Build and return the "everything" bundle — generated code + spec
+     * + Postman collection + test stubs + client configs in a single
+     * zip. The bundle is also persisted to object storage so subsequent
+     * downloads can re-stream the same artifact.
+     */
+    @GetMapping("/{id}/bundle/download")
+    public ResponseEntity<ByteArrayResource> downloadBundle(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        McpBundleBuilder.Bundle bundle = bundleBuilder.buildAndStore(p);
+        return ResponseEntity.ok()
+                .header(HttpHeaders.CONTENT_DISPOSITION,
+                        "attachment; filename=\"" + bundle.fileName().replace("\"", "") + "\"")
+                .contentType(MediaType.parseMediaType("application/zip"))
+                .contentLength(bundle.sizeBytes())
+                .body(new ByteArrayResource(bundle.content()));
     }
 
     // ------------- Generation -------------

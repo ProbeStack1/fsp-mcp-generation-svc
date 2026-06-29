@@ -152,6 +152,56 @@ public class McpProject {
     private String  deployedServiceUrl;
     private Instant deployedAt;
 
+    // ---------------- lifecycle flags ----------------
+
+    /**
+     * Soft-delete marker. List endpoints filter these out by default so a
+     * project disappears from the catalog without losing its history.
+     * Pair with {@code deleteEvent} for the audit trail. A deleted project
+     * can be restored via {@code POST /projects/{id}/restore} as long as
+     * it has not been hard-purged.
+     */
+    @Indexed private boolean softDeleted;
+    private DeleteEvent deleteEvent;
+
+    /**
+     * Deprecation marks the project as "do not consume new" while keeping
+     * the artifacts available for existing callers. Mirrors the same flag
+     * used on senior's microservice docs.
+     */
+    private boolean deprecated;
+    private Instant deprecatedAt;
+    private String  deprecatedBy;
+    private String  deprecationReason;
+
+    /**
+     * Parent pointer for projects produced by {@code POST /projects/{id}/clone}.
+     * Lets the catalog show "Cloned from …" and lets us walk the lineage.
+     */
+    private String cloneOf;
+
+    /**
+     * Parent pointer + semver string for projects produced by
+     * {@code POST /projects/{id}/version}. {@code versionOf} points at the
+     * previous version's document id; {@code versionNumber} is the semver
+     * the user picked for THIS document.
+     */
+    private String versionOf;
+    private String versionNumber;          // e.g. "1.0.0"
+
+    /**
+     * Per-step completion ledger driving the wizard's progress bar and the
+     * "Created by X on date" stamp on each completed step. Append-only —
+     * the most recent entry for a given {@code stepNumber} wins on read.
+     */
+    @Builder.Default private List<StepCompletion> stepCompletion = new java.util.ArrayList<>();
+
+    /**
+     * Records of test/tool/mock executions triggered from the wizard. Kept
+     * bounded to the most recent 50 entries by the service layer.
+     */
+    @Builder.Default private List<RunEntry> runHistory = new java.util.ArrayList<>();
+
     // ---------------- nested types ----------------
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
@@ -174,6 +224,19 @@ public class McpProject {
         private String serviceNowGroup;
         private String serviceNowEmail;
         @Builder.Default private List<String> consumerIds = List.of();
+
+        /**
+         * Free-form bag where the wizard's Step 7 substeps stash the
+         * user's generation choices (test kinds, helper artefacts,
+         * client configs to ship). Stored as a {@code Map} on purpose
+         * — adding a new option later should not require redeploying
+         * the model.
+         */
+        @Builder.Default private java.util.Map<String, Object> generationOptions = new java.util.LinkedHashMap<>();
+
+        /** Catalog summary mirrored from senior's requirements-svc so
+         *  list pages can render a one-liner without a join. */
+        private String requirementSummary;
     }
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
@@ -359,5 +422,50 @@ public class McpProject {
         @Builder.Default private Integer totalDeploys        = 0;
         @Builder.Default private Integer totalDeploysSuccess = 0;
         @Builder.Default private Integer totalDeploysFailed  = 0;
+    }
+
+    /**
+     * One row in {@link #stepCompletion}. The service appends a new row
+     * every time a wizard step is marked complete (or re-completed on
+     * re-entry), so callers can either read the latest entry per step or
+     * walk the full history.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class StepCompletion {
+        private Integer stepNumber;     // 1..11
+        private String  stepName;       // e.g. "MCP Design Validation"
+        private AuditActor completedBy;
+        private String  status;         // success | skipped | failed
+        private String  note;           // optional, e.g. validator summary
+    }
+
+    /**
+     * One row in {@link #runHistory}. Captures a single tool-call or
+     * test-suite execution started from the wizard. Heavy outputs (full
+     * tool response, large log) live in GCS; this row only carries the
+     * summary the audit timeline needs.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class RunEntry {
+        private AuditActor by;
+        private String kind;            // tool-simulate | test-case | static-analysis
+        private String target;          // tool name / test id
+        private String status;          // success | failed | timeout
+        private Long   durationMs;
+        private String resultSummary;   // short, human readable
+        private String resultObjectKey; // optional GCS path for the full payload
+    }
+
+    /**
+     * Captured when {@link #softDeleted} flips to {@code true}. Restoring
+     * the project keeps the event for the audit trail but flips the flag
+     * back to {@code false}.
+     */
+    @Data @Builder @NoArgsConstructor @AllArgsConstructor
+    public static class DeleteEvent {
+        private AuditActor by;
+        private String reason;
+        private Instant restoredAt;     // populated only after a restore
+        private AuditActor restoredBy;
     }
 }
