@@ -31,6 +31,7 @@ public class McpProject {
 
     @Id
     private String id;                    // generated UUID
+    private String mockServerId; 
 
     @Indexed private String ownerEmail;   // free-form identifier supplied by caller
     @Indexed private String workspaceId;  // free-form identifier supplied by caller

@@ -6,8 +6,11 @@ import com.forgesphere.mcpgen.model.McpProject.Generated;
 import com.forgesphere.mcpgen.repo.McpProjectRepository;
 import com.forgesphere.mcpgen.storage.StorageClient;
 import com.forgesphere.mcpgen.storage.StoredObject;
+import com.forgesphere.mcpgen.service.MicroserviceBridgeService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
+import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.context.annotation.Lazy;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
 import org.springframework.data.mongodb.core.query.Query;
@@ -23,8 +26,7 @@ import java.util.zip.ZipOutputStream;
 
 /**
  * Orchestrator for everything the controller layer doesn't do itself:
- * CRUD, generation (delegates to language-specific `CodeGenerator`),
- * zip streaming/persistence, and client-config snippet assembly.
+ * CRUD, generation, zip streaming/persistence, and client-config snippet assembly.
  */
 @Slf4j
 @Service
@@ -36,7 +38,10 @@ public class McpGenerationService {
     private final StorageClient storage;
     private final GenerationPostProcessor postProcessor;
     private final MongoTemplate mongoTemplate;
-    private final MicroserviceBridgeService bridgeService; // NEW injection
+
+    @Lazy
+    @Autowired
+    private MicroserviceBridgeService bridgeService; // Lazy to break circular dependency
 
     // ------------------------------------------------------------- CRUD
 
@@ -58,7 +63,7 @@ public class McpGenerationService {
 
         McpProject saved = repo.save(p);
 
-        // NEW: Create the mirrored microservice record
+        // Create the mirrored microservice record (uses lazy proxy)
         try {
             String microserviceId = bridgeService.createMicroserviceOnly(saved);
             saved.setMicroserviceMirrorId(microserviceId);
