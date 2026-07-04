@@ -110,6 +110,86 @@ public class MicroserviceBridgeService {
         return mongo.getMongoDatabaseFactory().getMongoDatabase(db).getCollection(collectionName);
     }
 
+    // ─────────── NEW: Early microservice creation ───────────────────────
+
+    /**
+     * Creates a minimal microservice record for the MCP project (without
+     * any deployment artefact or zip). This allows the project to be used
+     * with downstream services (mock, contract, test, etc.) immediately.
+     *
+     * @param project the MCP project
+     * @return the id of the newly created (or existing) microservice record
+     */
+    public String createMicroserviceOnly(McpProject project) {
+        String microserviceId = project.getMicroserviceMirrorId();
+        if (microserviceId != null && !microserviceId.isBlank()) {
+            // Already exists – just return it (idempotent)
+            return microserviceId;
+        }
+
+        // Generate a fresh ObjectId for the microservice doc
+        microserviceId = new ObjectId().toHexString();
+        project.setMicroserviceMirrorId(microserviceId);
+
+        // Build the microservice doc using the same logic as upsertMicroserviceDoc,
+        // but without codeGenResultId or deployment fields.
+        org.bson.Document doc = buildMicroserviceDocument(project, null);
+
+        // Insert the doc
+        bridgeColl(props.getColl().getMicroservice()).insertOne(doc);
+        log.info("[bridge] Created microservice record {} for MCP project {}",
+                microserviceId, project.getId());
+
+        // Save the project with the new microserviceId
+        projects.save(project);
+        return microserviceId;
+    }
+
+    /**
+     * Builds the microservice document from the MCP project data.
+     * Reused by createMicroserviceOnly and upsertMicroserviceDoc.
+     */
+    private org.bson.Document buildMicroserviceDocument(McpProject project, String codeGenResultId) {
+        var ob = project.getOnboarding();
+        var id = project.getIdentity();
+        String organizationId = resolveOrganizationId(project);
+        Date now = Date.from(Instant.now());
+
+        org.bson.Document doc = new org.bson.Document();
+        doc.put("_id", parseIdMaybe(project.getMicroserviceMirrorId()));
+        doc.put("projectType", PROJECT_TYPE_MCP);
+        doc.put("organizationId", organizationId);
+        doc.put("businessUnit", ob == null ? null : ob.getBusinessUnit());
+        doc.put("teamName", ob == null ? null : ob.getTeamName());
+        doc.put("applicationName", ob == null ? null : ob.getApplicationName());
+        doc.put("applicationId", ob == null ? null : ob.getApplicationId());
+        doc.put("onboardingId", project.getOnboardingId());
+        doc.put("apiName", id == null ? null : id.getDisplayName());
+        doc.put("projectOwner", ob == null ? null : ob.getProjectOwner());
+        doc.put("ownerEmail", ob == null ? null : ob.getOwnerEmail());
+        doc.put("projectSME", ob == null ? null : ob.getProjectSME());
+        doc.put("projectSMEEmail", ob == null ? null : ob.getProjectSMEEmail());
+        doc.put("projectDLEmail", ob == null ? null : ob.getProjectDLEmail());
+        doc.put("expectedGoLiveDate", ob == null ? null : ob.getExpectedGoLiveDate());
+        doc.put("testerName", ob == null ? null : ob.getTesterName());
+        doc.put("testerEmail", ob == null ? null : ob.getTesterEmail());
+        doc.put("serviceNowGroupName", ob == null ? null : ob.getServiceNowGroupName());
+        doc.put("serviceNowEmail", ob == null ? null : ob.getServiceNowEmail());
+        doc.put("consumerIds", ob == null || ob.getConsumerIds() == null
+                ? List.of() : ob.getConsumerIds());
+        doc.put("connectorId", resolveConnectorId(project));
+        doc.put("mcpProjectId", project.getId());
+        doc.put("mcpSlug", id == null ? null : id.getSlug());
+        doc.put("createdAt", now);
+        doc.put("updatedAt", now);
+        doc.put("_class", CLASS_MICROSERVICE);
+
+        if (codeGenResultId != null && !codeGenResultId.isBlank()) {
+            doc.put("codeGenResultId", codeGenResultId);
+        }
+        return doc;
+    }
+
     /**
      * Public entry point. Returns the bridge identifiers so the caller
      * can chain the existing {@code uploadToGitHub(microserviceId)} call.
@@ -967,45 +1047,16 @@ public class MicroserviceBridgeService {
         log.debug("[bridge] upserted {} _id={}", props.getColl().getCodegenResults(), codeGenResultId);
     }
 
+    /**
+     * Upsert the microservice document using the shared builder.
+     * This method now reuses buildMicroserviceDocument to keep the logic DRY.
+     */
     private void upsertMicroserviceDoc(McpProject p, String microserviceId, String codeGenResultId) {
-        var ob = p.getOnboarding();
-        var id = p.getIdentity();
-        String organizationId = resolveOrganizationId(p);
-        Date now = Date.from(Instant.now());
-        Map<String, Object> doc = new LinkedHashMap<>();
-        doc.put("_id",                 parseIdMaybe(microserviceId));
-        doc.put("codeGenResultId",     codeGenResultId);
-        doc.put("projectType",         PROJECT_TYPE_MCP);
-        // ---- onboarding snapshot (denormalised, same pattern as ) ----
-        doc.put("organizationId",      organizationId);
-        doc.put("businessUnit",        ob == null ? null : ob.getBusinessUnit());
-        doc.put("teamName",            ob == null ? null : ob.getTeamName());
-        doc.put("applicationName",     ob == null ? null : ob.getApplicationName());
-        doc.put("applicationId",       ob == null ? null : ob.getApplicationId());
-        doc.put("onboardingId",        p.getOnboardingId());
-        doc.put("apiName",             id == null ? null : id.getDisplayName());
-        doc.put("projectOwner",        ob == null ? null : ob.getProjectOwner());
-        doc.put("ownerEmail",          ob == null ? null : ob.getOwnerEmail());
-        doc.put("projectSME",          ob == null ? null : ob.getProjectSME());
-        doc.put("projectSMEEmail",     ob == null ? null : ob.getProjectSMEEmail());
-        doc.put("projectDLEmail",      ob == null ? null : ob.getProjectDLEmail());
-        doc.put("expectedGoLiveDate",  ob == null ? null : ob.getExpectedGoLiveDate());
-        doc.put("testerName",          ob == null ? null : ob.getTesterName());
-        doc.put("testerEmail",         ob == null ? null : ob.getTesterEmail());
-        doc.put("serviceNowGroupName", ob == null ? null : ob.getServiceNowGroupName());
-        doc.put("serviceNowEmail",     ob == null ? null : ob.getServiceNowEmail());
-        doc.put("consumerIds",         ob == null || ob.getConsumerIds() == null
-                                            ? List.of() : ob.getConsumerIds());
-        doc.put("connectorId",         resolveConnectorId(p));
-        doc.put("mcpProjectId",        p.getId());
-        doc.put("mcpSlug",             id == null ? null : id.getSlug());
-        doc.put("createdAt",           now);
-        doc.put("updatedAt",           now);
-        doc.put("_class",              CLASS_MICROSERVICE);
-
+        p.setMicroserviceMirrorId(microserviceId);
+        org.bson.Document doc = buildMicroserviceDocument(p, codeGenResultId);
         bridgeColl(props.getColl().getMicroservice()).replaceOne(
                 new org.bson.Document("_id", parseIdMaybe(microserviceId)),
-                new org.bson.Document(doc),
+                doc,
                 new com.mongodb.client.model.ReplaceOptions().upsert(true));
         log.debug("[bridge] upserted {} _id={}", props.getColl().getMicroservice(), microserviceId);
     }

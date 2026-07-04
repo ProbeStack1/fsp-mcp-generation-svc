@@ -36,8 +36,14 @@ public class McpGenerationService {
     private final StorageClient storage;
     private final GenerationPostProcessor postProcessor;
     private final MongoTemplate mongoTemplate;
+    private final MicroserviceBridgeService bridgeService; // NEW injection
 
     // ------------------------------------------------------------- CRUD
+
+    /**
+     * Creates a new MCP project and immediately mirrors it into a microservice
+     * record so downstream services can be called.
+     */
     public McpProject create(McpProject p) {
         p.setId(UUID.randomUUID().toString());
         Instant now = Instant.now();
@@ -49,7 +55,20 @@ public class McpGenerationService {
         if (p.getTransport() == null)   p.setTransport(McpProject.Transport.builder().kind("streamable-http").baseUrl("http://localhost:3500/mcp").build());
         if (p.getAuth() == null)        p.setAuth(McpProject.Auth.builder().kind("bearer").headerName("Authorization").build());
         if (p.getAdvanced() == null)    p.setAdvanced(McpProject.Advanced.builder().build());
-        return repo.save(p);
+
+        McpProject saved = repo.save(p);
+
+        // NEW: Create the mirrored microservice record
+        try {
+            String microserviceId = bridgeService.createMicroserviceOnly(saved);
+            saved.setMicroserviceMirrorId(microserviceId);
+            saved = repo.save(saved);
+            log.info("Created microservice mirror {} for MCP project {}", microserviceId, saved.getId());
+        } catch (Exception e) {
+            log.error("Failed to create microservice mirror for project {}: {}", saved.getId(), e.getMessage(), e);
+        }
+
+        return saved;
     }
 
     public List<McpProject> list(String ownerEmail, String workspaceId) {
@@ -214,7 +233,7 @@ public class McpGenerationService {
         copy.setLastDownloadedAt(null);
         copy.setStepCompletion(new java.util.ArrayList<>());
         copy.setRunHistory(new java.util.ArrayList<>());
-        copy.setAuditTrail(null); // AuditService will lazy-init on first record
+        copy.setAuditTrail(null);
         // Slug nudge so the clone doesn't collide with the original in the same workspace.
         if (copy.getIdentity() != null) {
             String slug = newSlug != null && !newSlug.isBlank()
@@ -232,7 +251,20 @@ public class McpGenerationService {
             copy.setCreatedBy(actor.getEmail());
             copy.setUpdatedBy(actor.getEmail());
         }
-        return repo.save(copy);
+
+        McpProject savedCopy = repo.save(copy);
+
+        // NEW: Create a fresh microservice record for the clone
+        try {
+            String microserviceId = bridgeService.createMicroserviceOnly(savedCopy);
+            savedCopy.setMicroserviceMirrorId(microserviceId);
+            savedCopy = repo.save(savedCopy);
+            log.info("Created microservice mirror {} for cloned MCP project {}", microserviceId, savedCopy.getId());
+        } catch (Exception e) {
+            log.error("Failed to create microservice mirror for cloned project {}: {}", savedCopy.getId(), e.getMessage(), e);
+        }
+
+        return savedCopy;
     }
 
     /**
@@ -275,7 +307,20 @@ public class McpGenerationService {
             copy.setCreatedBy(actor.getEmail());
             copy.setUpdatedBy(actor.getEmail());
         }
-        return repo.save(copy);
+
+        McpProject savedCopy = repo.save(copy);
+
+        // NEW: Create a fresh microservice record for the version
+        try {
+            String microserviceId = bridgeService.createMicroserviceOnly(savedCopy);
+            savedCopy.setMicroserviceMirrorId(microserviceId);
+            savedCopy = repo.save(savedCopy);
+            log.info("Created microservice mirror {} for versioned MCP project {}", microserviceId, savedCopy.getId());
+        } catch (Exception e) {
+            log.error("Failed to create microservice mirror for versioned project {}: {}", savedCopy.getId(), e.getMessage(), e);
+        }
+
+        return savedCopy;
     }
 
     /**
