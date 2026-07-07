@@ -1,11 +1,11 @@
 name: PROD GKE Deploy - MCP Generation Service
- 
+
 on:
   push:
     branches:
       - gke_mongo_db
   workflow_dispatch:
- 
+
 env:
   PROJECT_ID: probestack-prod
   ARTIFACT_REPO: probestack-prod-apps
@@ -15,23 +15,23 @@ env:
   GKE_LOCATION: us-central1-a
   GKE_LOCATION_FLAG: --zone
   NAMESPACE: forgesphere-prod
- 
+
 jobs:
   deploy-prod-profile-config:
- 
+
     if: github.ref == 'refs/heads/gke_mongo_db'
- 
+
     runs-on: ubuntu-latest
- 
+
     permissions:
       contents: read
       id-token: write
- 
+
     steps:
- 
+
       - name: Checkout source code
         uses: actions/checkout@v4
- 
+
       - name: Authenticate to Google Cloud
         id: auth
         uses: google-github-actions/auth@v2
@@ -39,33 +39,33 @@ jobs:
           workload_identity_provider: projects/861433193200/locations/global/workloadIdentityPools/github-pool/providers/github-provider
           service_account: github-actions-deployer@probestack-prod.iam.gserviceaccount.com
           token_format: access_token
- 
+
       - name: Setup gcloud CLI
         uses: google-github-actions/setup-gcloud@v2
- 
+
       - name: Install GKE auth plugin
         run: gcloud components install gke-gcloud-auth-plugin --quiet
- 
+
       - name: Set up JDK 17
         uses: actions/setup-java@v4
         with:
           java-version: '17'
           distribution: 'temurin'
           cache: 'maven'
- 
+
       - name: Build JAR
         run: mvn --batch-mode --no-transfer-progress clean package -DskipTests
- 
+
       - name: Login to Artifact Registry
         uses: docker/login-action@v3
         with:
           registry: us-central1-docker.pkg.dev
           username: oauth2accesstoken
           password: ${{ steps.auth.outputs.access_token }}
- 
+
       - name: Setup Docker Buildx
         uses: docker/setup-buildx-action@v3
- 
+
       - name: Build and Push Image
         uses: docker/build-push-action@v5
         with:
@@ -76,24 +76,40 @@ jobs:
             ${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
- 
+
       - name: Get GKE credentials
         run: |
           gcloud container clusters get-credentials ${{ env.GKE_CLUSTER }} \
           ${{ env.GKE_LOCATION_FLAG }} ${{ env.GKE_LOCATION }} \
           --project ${{ env.PROJECT_ID }}
- 
+
       - name: Deploy deployment service
         run: |
           kubectl set image deployment/${{ env.SERVICE_NAME }} \
           ${{ env.SERVICE_NAME }}=${{ env.ARTIFACT_REGISTRY }}/${{ env.PROJECT_ID }}/${{ env.ARTIFACT_REPO }}/${{ env.SERVICE_NAME }}:${{ github.sha }} \
           -n ${{ env.NAMESPACE }}
- 
+
+      # ----- DEBUG: capture logs for 2 minutes WITHOUT blocking rollout -----
+      - name: Capture logs for first 2 minutes (background)
+        run: |
+          # Wait for new pod to appear
+          for i in {1..30}; do
+            NEW_POD=$(kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }} --sort-by=.metadata.creationTimestamp -o jsonpath='{.items[-1].metadata.name}')
+            if [ -n "$NEW_POD" ] && [ "$NEW_POD" != "$(kubectl get pods -n ${{ env.NAMESPACE }} -l app=${{ env.SERVICE_NAME }} -o jsonpath='{.items[0].metadata.name}')" ]; then
+              echo "New pod detected: $NEW_POD"
+              break
+            fi
+            sleep 2
+          done
+          # Start capturing logs in background, stop after 2 minutes
+          timeout 120 kubectl logs -n ${{ env.NAMESPACE }} $NEW_POD --tail=1000 -f || true
+        continue-on-error: true
+
       - name: Wait for deployment rollout
         run: |
           kubectl rollout status deployment/${{ env.SERVICE_NAME }} \
           -n ${{ env.NAMESPACE }}
- 
+
       - name: Verify running pods
         run: |
           kubectl get pods -n ${{ env.NAMESPACE }}
