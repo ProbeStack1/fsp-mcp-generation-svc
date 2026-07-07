@@ -7,8 +7,11 @@ import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Service;
 
+import java.io.ByteArrayOutputStream;
 import java.time.Instant;
 import java.util.*;
+import java.util.zip.ZipEntry;
+import java.util.zip.ZipOutputStream;
 
 @Service
 @Slf4j
@@ -25,7 +28,8 @@ public class McpMockService {
     private String mockServiceBaseUrl;
 
     /**
-     * Create a mock server from the project's capabilities.
+     * Create or update a mock server from the project's capabilities (UPSERT).
+     * If a mock already exists for this project, it is replaced.
      */
     public McpMockServer createMockFromProject(String projectId, String transport, String userEmail) {
         // 1. Fetch project
@@ -42,26 +46,49 @@ public class McpMockService {
             );
         }
 
-        // 3. Generate unique mock URL
-        String mockUrl = generateMockUrl();
-        while (mockServerRepository.existsByMockUrl(mockUrl)) {
-            mockUrl = generateMockUrl();
+        // 3. Check existing mock
+        McpMockServer existing = mockServerRepository.findByProjectId(projectId).orElse(null);
+
+        McpMockServer mockServer;
+        if (existing != null) {
+            // Update existing mock
+            mockServer = existing;
+            // Clean old tools/resources/prompts
+            mockToolRepository.deleteByMockServerId(mockServer.getId());
+            mockResourceRepository.deleteByMockServerId(mockServer.getId());
+            mockPromptRepository.deleteByMockServerId(mockServer.getId());
+        } else {
+            // Create new mock – generate unique mock URL
+            String mockUrl = generateMockUrl();
+            while (mockServerRepository.existsByMockUrl(mockUrl)) {
+                mockUrl = generateMockUrl();
+            }
+            mockServer = McpMockServer.builder()
+                    .id(UUID.randomUUID().toString())
+                    .projectId(projectId)
+                    .name(project.getIdentity().getDisplayName() + "-mock")
+                    .mockUrl(mockUrl)
+                    .createdAt(Instant.now())
+                    .build();
         }
 
-        // 4. Build and save mock server
-        McpMockServer mockServer = McpMockServer.builder()
-                .id(UUID.randomUUID().toString())
-                .projectId(projectId)
-                .name(project.getIdentity().getDisplayName() + "-mock")
-                .mockUrl(mockUrl)
-                .mockServerUrl(buildMockServerUrl(mockUrl))
-                .transport(transport)
-                .generatedBy(userEmail != null ? userEmail : "system")
-                .generatedAt(Instant.now())
-                .requestCount(0L)
-                .createdAt(Instant.now())
-                .updatedAt(Instant.now())
-                .build();
+        // 4. Update common fields
+        String mockUrl = mockServer.getMockUrl();
+        mockServer.setTransport(transport);
+        mockServer.setGeneratedBy(userEmail != null ? userEmail : "system");
+        mockServer.setGeneratedAt(Instant.now());
+        mockServer.setUpdatedAt(Instant.now());
+
+        if ("http".equals(transport)) {
+            mockServer.setMockServerUrl(buildMockServerUrl(mockUrl));
+            mockServer.setDownloadUrl(null);
+        } else {
+            // Stdio: no HTTP URL; download URL will be resolved when requested
+            mockServer.setMockServerUrl(null);
+            mockServer.setDownloadUrl(null); // Will be set by the download endpoint if needed
+        }
+
+        // Save mock server
         mockServer = mockServerRepository.save(mockServer);
 
         // 5. Create mock tools, resources, prompts
@@ -77,12 +104,8 @@ public class McpMockService {
         }
         projectRepository.save(project);
 
-        log.info("MCP mock server created: projectId={}, mockUrl={}, tools={}, resources={}, prompts={}",
-                projectId, mockUrl,
-                project.getCapabilities().getTools().size(),
-                project.getCapabilities().getResources().size(),
-                project.getCapabilities().getPrompts().size()
-        );
+        log.info("MCP mock server {} (transport={}) for project {}",
+                mockServer.getId(), transport, projectId);
 
         return mockServer;
     }
@@ -140,6 +163,7 @@ public class McpMockService {
     }
 
     // ---------- Mock Data Generators ----------
+
     private Map<String, Object> generateMockRequest(McpProject.Tool tool) {
         Map<String, Object> mock = new LinkedHashMap<>();
         Map<String, Object> schema = tool.getInputSchema() != null
@@ -210,12 +234,12 @@ public class McpMockService {
     }
 
     // ---------- Helpers ----------
+
     private String generateMockUrl() {
         return "mcp-mock-" + UUID.randomUUID().toString().substring(0, 8);
     }
 
     private String buildMockServerUrl(String mockUrl) {
-        // Base URL + context path + /mocks/{mockUrl}/mcp
         String base = mockServiceBaseUrl != null ? mockServiceBaseUrl.trim() : "";
         if (base.endsWith("/")) base = base.substring(0, base.length() - 1);
         return base + "/mcp-generate/v1/api/mocks/" + mockUrl + "/mcp";
@@ -235,5 +259,122 @@ public class McpMockService {
             mockServerRepository.deleteById(mockId);
             log.info("Deleted MCP mock server: projectId={}, mockId={}", projectId, mockId);
         }
+    }
+
+    /**
+     * Generate a zip file containing a stdio mock server.
+     */
+    public byte[] generateMockZip(String projectId) {
+        McpMockServer mock = mockServerRepository.findByProjectId(projectId)
+                .orElseThrow(() -> new IllegalArgumentException("Mock server not found for project: " + projectId));
+
+        if (!"stdio".equals(mock.getTransport())) {
+            throw new IllegalStateException("Mock transport is not stdio, cannot generate zip.");
+        }
+
+        McpProject project = projectRepository.findById(projectId)
+                .orElseThrow(() -> new IllegalArgumentException("Project not found: " + projectId));
+
+        List<McpProject.Tool> tools = project.getCapabilities().getTools();
+        List<McpProject.Resource> resources = project.getCapabilities().getResources();
+        List<McpProject.Prompt> prompts = project.getCapabilities().getPrompts();
+
+        // Build a simple Node.js MCP mock server
+        StringBuilder indexJs = new StringBuilder();
+        indexJs.append("const { Server } = require('@modelcontextprotocol/sdk/server/index.js');\n");
+        indexJs.append("const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');\n");
+        indexJs.append("const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types');\n\n");
+        indexJs.append("const server = new Server({\n");
+        indexJs.append("  name: 'mcp-mock',\n");
+        indexJs.append("  version: '1.0.0'\n");
+        indexJs.append("}, { capabilities: { tools: {} } });\n\n");
+        // List tools handler
+        indexJs.append("server.setRequestHandler(ListToolsRequestSchema, async () => ({\n");
+        indexJs.append("  tools: [\n");
+        for (McpProject.Tool t : tools) {
+            indexJs.append("    {\n");
+            indexJs.append("      name: '").append(t.getName()).append("',\n");
+            indexJs.append("      description: '").append(t.getDescription()).append("',\n");
+            indexJs.append("      inputSchema: ").append(t.getInputSchema()).append("\n");
+            indexJs.append("    },\n");
+        }
+        indexJs.append("  ]\n");
+        indexJs.append("}));\n\n");
+        // Tool call handler
+        indexJs.append("server.setRequestHandler(CallToolRequestSchema, async (request) => {\n");
+        indexJs.append("  const { name, arguments: args } = request.params;\n");
+        indexJs.append("  // Mock responses\n");
+        for (McpProject.Tool t : tools) {
+            String toolName = t.getName();
+            indexJs.append("  if (name === '").append(toolName).append("') {\n");
+            indexJs.append("    return {\n");
+            indexJs.append("      content: [{\n");
+            indexJs.append("        type: 'text',\n");
+            indexJs.append("        text: JSON.stringify(").append(generateMockResponseJson(t)).append(")\n");
+            indexJs.append("      }]\n");
+            indexJs.append("    };\n");
+            indexJs.append("  }\n");
+        }
+        indexJs.append("  throw new Error('Unknown tool: ' + name);\n");
+        indexJs.append("});\n\n");
+        indexJs.append("const transport = new StdioServerTransport();\n");
+        indexJs.append("server.connect(transport);\n");
+
+        // package.json
+        String packageJson = "{\n" +
+                "  \"name\": \"mcp-mock\",\n" +
+                "  \"version\": \"1.0.0\",\n" +
+                "  \"description\": \"MCP Mock Server\",\n" +
+                "  \"main\": \"index.js\",\n" +
+                "  \"scripts\": {\n" +
+                "    \"start\": \"node index.js\"\n" +
+                "  },\n" +
+                "  \"dependencies\": {\n" +
+                "    \"@modelcontextprotocol/sdk\": \"^1.0.0\"\n" +
+                "  }\n" +
+                "}\n";
+
+        // README
+        String readme = "# MCP Mock Server (Stdio)\n\n" +
+                "This is a mock MCP server for project " + projectId + ".\n\n" +
+                "## Setup\n\n" +
+                "```bash\nnpm install\n```\n\n" +
+                "## Run\n\n" +
+                "```bash\nnpm start\n```\n\n" +
+                "The server will run over stdio and respond to tools/list and tools/call with mock data.\n";
+
+        // Build zip
+        ByteArrayOutputStream baos = new ByteArrayOutputStream();
+        try (ZipOutputStream zos = new ZipOutputStream(baos)) {
+            // index.js
+            ZipEntry entry1 = new ZipEntry("index.js");
+            zos.putNextEntry(entry1);
+            zos.write(indexJs.toString().getBytes());
+            zos.closeEntry();
+
+            // package.json
+            ZipEntry entry2 = new ZipEntry("package.json");
+            zos.putNextEntry(entry2);
+            zos.write(packageJson.getBytes());
+            zos.closeEntry();
+
+            // README.md
+            ZipEntry entry3 = new ZipEntry("README.md");
+            zos.putNextEntry(entry3);
+            zos.write(readme.getBytes());
+            zos.closeEntry();
+        } catch (Exception e) {
+            throw new RuntimeException("Failed to create zip", e);
+        }
+        return baos.toByteArray();
+    }
+
+    private String generateMockResponseJson(McpProject.Tool tool) {
+        Map<String, Object> mock = new LinkedHashMap<>();
+        mock.put("id", "mock-" + UUID.randomUUID().toString().substring(0, 8));
+        mock.put("status", "success");
+        mock.put("data", Map.of("message", "Mock response for " + tool.getName()));
+        mock.put("timestamp", Instant.now().toString());
+        return mock.toString();
     }
 }

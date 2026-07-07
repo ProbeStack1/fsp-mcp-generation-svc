@@ -20,12 +20,13 @@ public class McpMockServer {
     @Id
     private String id;
 
-    @Indexed
-    private String projectId;           // Reference to McpProject
+    @Indexed(unique = true)   // Ensures one mock per project
+    private String projectId;
 
     private String name;
     private String mockUrl;             // Unique routing key (e.g., mcp-mock-abc)
-    private String mockServerUrl;       // Full base URL for MCP endpoint
+    private String mockServerUrl;       // Full base URL for MCP endpoint (HTTP only)
+    private String downloadUrl;         // Download URL for stdio mock zip (optional)
     private String transport;           // "http" or "stdio"
 
     private String generatedBy;         // User email

@@ -4,6 +4,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.SerializationFeature;
 import com.fasterxml.jackson.datatype.jsr310.JavaTimeModule;
 import com.forgesphere.mcpgen.model.McpProject;
+import com.forgesphere.mcpgen.model.McpProject.Tool;
 import com.forgesphere.mcpgen.storage.StorageClient;
 import com.forgesphere.mcpgen.storage.StoredObject;
 import lombok.RequiredArgsConstructor;
@@ -16,14 +17,12 @@ import org.springframework.data.mongodb.core.query.Update;
 import org.springframework.stereotype.Service;
 
 import java.io.ByteArrayOutputStream;
+import java.net.URL;
 import java.nio.charset.StandardCharsets;
+import java.time.Duration;
 import java.time.Instant;
 import java.time.format.DateTimeFormatter;
-import java.util.ArrayList;
-import java.util.LinkedHashMap;
-import java.util.List;
-import java.util.Map;
-import java.util.UUID;
+import java.util.*;
 import java.util.zip.ZipEntry;
 import java.util.zip.ZipOutputStream;
 
@@ -54,6 +53,7 @@ public class McpBundleBuilder {
     private final McpGenerationService genSvc;
     private final StorageClient storage;
     private final MongoTemplate mongoTemplate;
+    private final TestCollectionGenerator testCollectionGenerator; // NEW
 
     @Value("${mcp.bundle.prefix:bundles}")
     private String bundlePrefix;
@@ -92,6 +92,10 @@ public class McpBundleBuilder {
             fileCount += writeTests(zip, project);
             fileCount += writeClientConfigs(zip, project);
             fileCount += writeReadme(zip, project);
+            // ---- NEW: Write test collection (scenario-based) ----
+            fileCount += writeTestCollection(zip, project);
+            // ---- NEW: Write mock responses ----
+            fileCount += writeMockResponses(zip, project);
         } catch (Exception ex) {
             throw new IllegalStateException("Failed to assemble MCP bundle for " + project.getId(), ex);
         }
@@ -103,6 +107,31 @@ public class McpBundleBuilder {
         StoredObject stored = storage.upload(objectKey, bytes, "application/zip");
         log.info("Bundle stored for project={} bytes={} files={} key={}",
                 project.getId(), bytes.length, fileCount, stored.getObjectPath());
+
+        // ---- NEW: Upload test collection as a separate JSON artifact ----
+        String testCollectionKey = "test-collections/" + project.getId() + "/" + UUID.randomUUID() + ".json";
+        Map<String, String> testData = testCollectionGenerator.generate(project);
+        Map<String, Object> combined = new LinkedHashMap<>();
+        combined.put("postmanCollection", testData.get("postmanCollection"));
+        combined.put("scenarioMetadata", testData.get("scenarioMetadata"));
+        String combinedJson;
+        try {
+            combinedJson = json.writeValueAsString(combined);
+        } catch (Exception e) {
+            combinedJson = "{}";
+        }
+        StoredObject testStored = storage.upload(testCollectionKey, combinedJson.getBytes(), "application/json");
+        URL testUrl = storage.signedDownloadUrl(testCollectionKey, Duration.ofDays(7));
+        String testCollectionUrl = testUrl != null ? testUrl.toString() : null;
+        if (testCollectionUrl != null) {
+            if (project.getGenerated() == null) {
+                project.setGenerated(McpProject.Generated.builder().build());
+            }
+            project.getGenerated().setTestCollectionUrl(testCollectionUrl);
+            // Persist the updated project so the URL is saved
+            genSvc.save(project);
+        }
+
         // ──────────────────────────────────────────────────────────
         // Mirror the freshly-uploaded zip into `codegen_results` so
         // senior's contract-testing-svc / analysis-svc / peer-review-svc
@@ -290,8 +319,48 @@ public class McpBundleBuilder {
           .append("- `spec/mcp-spec.json` — MCP capability definition\n")
           .append("- `postman/collection.json` — copy-paste JSON-RPC examples\n")
           .append("- `tests/` — test stubs keyed by tool name\n")
-          .append("- `client-configs/` — drop-in snippets for Claude Desktop, Cursor, ForgeQ\n");
+          .append("- `client-configs/` — drop-in snippets for Claude Desktop, Cursor, ForgeQ\n")
+          .append("- `test-collection/` — scenario-based Postman collection + metadata\n")
+          .append("- `mock-responses/` — sample mock responses for each tool\n");
         putEntry(zip, "README.md", sb.toString());
+        return 1;
+    }
+
+    // ---- NEW method to write test collection folder in the bundle ----
+    private int writeTestCollection(ZipOutputStream zip, McpProject p) throws Exception {
+        Map<String, String> testData = testCollectionGenerator.generate(p);
+        String postmanColl = testData.get("postmanCollection");
+        String scenarioMeta = testData.get("scenarioMetadata");
+        putEntry(zip, "test-collection/postman-collection.json", postmanColl);
+        putEntry(zip, "test-collection/scenario-metadata.json", scenarioMeta);
+        return 2;
+    }
+
+    // ---- NEW method to write mock responses ----
+    private int writeMockResponses(ZipOutputStream zip, McpProject p) throws Exception {
+        // Currently we don't have a dedicated mock response store; we can use the tool simulator to generate sample responses.
+        // We'll generate a simple JSON with mock responses for each tool.
+        Map<String, Object> mockMap = new LinkedHashMap<>();
+        if (p.getCapabilities() != null && p.getCapabilities().getTools() != null) {
+            for (Tool tool : p.getCapabilities().getTools()) {
+                // Use the same logic as simulator to produce a plausible response
+                Map<String, Object> mock = new LinkedHashMap<>();
+                mock.put("name", tool.getName());
+                mock.put("description", tool.getDescription());
+                mock.put("sampleResponse", Map.of(
+                        "content", List.of(Map.of("type", "text", "text", "Mock response for " + tool.getName())),
+                        "isError", false
+                ));
+                mockMap.put(tool.getName(), mock);
+            }
+        }
+        String mockJson;
+        try {
+            mockJson = json.writeValueAsString(mockMap);
+        } catch (Exception e) {
+            mockJson = "{}";
+        }
+        putEntry(zip, "mock-responses/mock-data.json", mockJson);
         return 1;
     }
 
@@ -339,7 +408,7 @@ public class McpBundleBuilder {
             for (McpProject.Tool t : p.getCapabilities().getTools()) {
                 sb.append("  /tools/").append(t.getName()).append(":\n");
                 sb.append("    post:\n");
-                sb.append("      summary: ").append(nz(t.getDescription(), t.getName())).append('\n');
+                sb.append("      summary: ").append(t.getDescription() == null ? t.getName() : t.getDescription()).append('\n');
                 sb.append("      responses:\n");
                 sb.append("        '200':\n");
                 sb.append("          description: OK\n");
@@ -347,6 +416,4 @@ public class McpBundleBuilder {
         }
         return sb.toString();
     }
-
-    private static String nz(String v, String fb) { return v == null || v.isBlank() ? fb : v; }
 }

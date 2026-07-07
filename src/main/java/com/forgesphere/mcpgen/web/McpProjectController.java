@@ -19,6 +19,7 @@ import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
 import org.springframework.web.servlet.mvc.method.annotation.StreamingResponseBody;
 
+import java.time.Instant;   // <-- ADDED THIS IMPORT
 import java.util.*;
 
 /**
@@ -518,9 +519,15 @@ public class McpProjectController {
     // ------------- Helpers -------------
     private GenerateResponse toGenerateResponse(McpProject p) {
         var g = p.getGenerated();
-        return new GenerateResponse(p.getId(), g.getFiles().size(), g.getTotalBytes(),
-                g.getFiles().stream().map(f -> new FileSummary(f.getPath(), f.getBytes(), f.getMimeHint())).toList(),
-                g.getGeneratedAt().toString());
+        return new GenerateResponse(
+                p.getId(),
+                g == null ? 0 : g.getFiles().size(),
+                g == null ? 0 : g.getTotalBytes(),
+                g == null ? List.of() : g.getFiles().stream()
+                        .map(f -> new FileSummary(f.getPath(), f.getBytes(), f.getMimeHint()))
+                        .toList(),
+                g == null ? Instant.now().toString() : g.getGeneratedAt().toString(),
+                g == null ? null : g.getTestCollectionUrl()  // NEW
+        );
     }
 }
-

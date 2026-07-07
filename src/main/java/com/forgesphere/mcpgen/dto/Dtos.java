@@ -28,8 +28,12 @@ public final class Dtos {
 
     // ---------- Generate ----------
     public record GenerateResponse(
-            String projectId, int fileCount, int totalBytes,
-            List<FileSummary> files, String generatedAt) {}
+            String projectId, 
+            int fileCount, 
+            int totalBytes,
+            List<FileSummary> files, 
+            String generatedAt,
+            String testCollectionUrl) {}  // NEW: URL for scenario-based test collection
 
     public record FileSummary(String path, int bytes, String mimeHint) {}
 

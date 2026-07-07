@@ -43,6 +43,11 @@ public class McpGenerationService {
     @Autowired
     private MicroserviceBridgeService bridgeService; // Lazy to break circular dependency
 
+    // ---- NEW: save method (used by bundle builder) ----
+    public McpProject save(McpProject p) {
+        return repo.save(p);
+    }
+
     // ------------------------------------------------------------- CRUD
 
     /**

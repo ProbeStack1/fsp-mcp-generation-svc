@@ -353,6 +353,8 @@ public class McpProject {
         private int totalBytes;
         private Instant generatedAt;
         private String checksum;
+        // ─── NEW: URL for the scenario-based test collection (Postman + metadata) ───
+        private String testCollectionUrl;
     }
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
