@@ -20,7 +20,7 @@ public class McpMockServer {
     @Id
     private String id;
 
-    @Indexed( name = "projectId_unique")  // Ensures one mock per project
+    @Indexed
     private String projectId;
 
     private String name;
