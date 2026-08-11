@@ -50,35 +50,38 @@ public class TestCollectionGenerator {
             String desc = tool.getDescription() == null ? "" : tool.getDescription();
 
             // --- 1. Positive scenario ---
-            Map<String, Object> positiveReq = buildRequest(serverUrl, toolName, generateValidArgs(tool), true);
+            Map<String, Object> validArgs = generateValidArgs(tool);
+            Map<String, Object> positiveReq = buildRequest(serverUrl, toolName, validArgs, true);
             items.add(createItem(toolName + " - Positive", positiveReq));
-            scenarioMetadata.add(createMeta(toolName, "POSITIVE", "Happy path with valid arguments", "200"));
+            scenarioMetadata.add(createMeta(toolName, "POSITIVE", "Happy path with valid arguments", "200", validArgs, true));
 
             // --- 2. Negative: missing required ---
             if (hasRequired(tool)) {
-                Map<String, Object> missingReq = buildRequest(serverUrl, toolName, generateMissingArgs(tool), true);
+                Map<String, Object> missingArgs = generateMissingArgs(tool);
+                Map<String, Object> missingReq = buildRequest(serverUrl, toolName, missingArgs, true);
                 items.add(createItem(toolName + " - Negative (missing required)", missingReq));
-                scenarioMetadata.add(createMeta(toolName, "NEGATIVE", "Missing required arguments", "400"));
+                scenarioMetadata.add(createMeta(toolName, "NEGATIVE", "Missing required arguments", "400", missingArgs, true));
             }
 
             // --- 3. Negative: invalid type ---
             if (hasProperties(tool)) {
-                Map<String, Object> invalidReq = buildRequest(serverUrl, toolName, generateInvalidTypeArgs(tool), true);
+                Map<String, Object> invalidArgs = generateInvalidTypeArgs(tool);
+                Map<String, Object> invalidReq = buildRequest(serverUrl, toolName, invalidArgs, true);
                 items.add(createItem(toolName + " - Negative (invalid type)", invalidReq));
-                scenarioMetadata.add(createMeta(toolName, "NEGATIVE", "Invalid argument type", "400"));
+                scenarioMetadata.add(createMeta(toolName, "NEGATIVE", "Invalid argument type", "400", invalidArgs, true));
             }
 
             // --- 4. Security: missing auth (if auth is enabled) ---
             if (project.getAuth() != null && !"none".equalsIgnoreCase(project.getAuth().getKind())) {
-                Map<String, Object> noAuthReq = buildRequest(serverUrl, toolName, generateValidArgs(tool), false);
+                Map<String, Object> noAuthReq = buildRequest(serverUrl, toolName, validArgs, false);
                 items.add(createItem(toolName + " - Security (missing auth)", noAuthReq));
-                scenarioMetadata.add(createMeta(toolName, "SECURITY", "Missing Authorization header", "401"));
+                scenarioMetadata.add(createMeta(toolName, "SECURITY", "Missing Authorization header", "401", validArgs, false));
             }
 
             // --- 5. Performance: simulate latency (no actual delay, just marker) ---
-            Map<String, Object> perfReq = buildRequest(serverUrl, toolName, generateValidArgs(tool), true);
+            Map<String, Object> perfReq = buildRequest(serverUrl, toolName, validArgs, true);
             items.add(createItem(toolName + " - Performance (latency test)", perfReq));
-            scenarioMetadata.add(createMeta(toolName, "PERFORMANCE", "Response time threshold test", "200"));
+            scenarioMetadata.add(createMeta(toolName, "PERFORMANCE", "Response time threshold test", "200", validArgs, true));
         }
 
         collection.put("item", items);
@@ -138,12 +141,18 @@ public class TestCollectionGenerator {
         return item;
     }
 
-    private Map<String, Object> createMeta(String toolName, String category, String description, String expectedStatus) {
+    private Map<String, Object> createMeta(String toolName, String category, String description, String expectedStatus,
+                                            Map<String, Object> arguments, boolean withAuth) {
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("toolName", toolName);
         meta.put("category", category);
         meta.put("description", description);
         meta.put("expectedStatus", expectedStatus);
+        // Carried straight through so the wizard's "Run" button can call the
+        // real tool with the exact arguments this scenario was built for,
+        // instead of guessing / sending an empty payload.
+        meta.put("arguments", arguments == null ? Map.of() : arguments);
+        meta.put("withAuth", withAuth);
         return meta;
     }
 
