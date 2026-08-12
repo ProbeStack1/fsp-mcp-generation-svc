@@ -333,8 +333,27 @@ public class MicroserviceBridgeService {
         String branch    = scm.getString("branch");
         if (token == null || token.isBlank()) throw new IllegalStateException("Connector has no GitHub token.");
         if (orgOrUser == null || orgOrUser.isBlank()) throw new IllegalStateException("Connector has no orgOrUser.");
-        if (repo == null || repo.isBlank()) throw new IllegalStateException("Connector has no repo.");
         if (branch == null || branch.isBlank()) branch = "main";
+
+        // ─── No repo name configured on the connector? Derive one from
+        // the MCP project itself (same behaviour the user expects from the
+        // microservice flow: generate → create a repo named after the
+        // service → push) instead of failing the push. Persisted back onto
+        // the connector so every later push targets the SAME repo, rather
+        // than re-deriving (and potentially creating a new one) each time.
+        if (repo == null || repo.isBlank()) {
+            repo = deriveRepoNameFromProject(mcp);
+            log.info("[push] connector has no repo configured — derived '{}' from the project", repo);
+            try {
+                scm.put("repo", repo);
+                conn.put("sourceCodeManagement", scm);
+                bridgeColl(props.getColl().getConnector()).replaceOne(
+                        new org.bson.Document("_id", parseIdMaybe(connectorId)), conn);
+            } catch (Exception e) {
+                log.warn("[push] failed to persist derived repo name onto connector {}: {}",
+                        connectorId, e.getMessage());
+            }
+        }
 
         log.info("[push] target=https://github.com/{}/{} branch={} files={}",
                 orgOrUser, repo, branch, mcp.getGenerated().getFiles().size());
@@ -567,6 +586,28 @@ public class MicroserviceBridgeService {
      *      target the correct ref.
      *   5. Poll until the branch ref is queryable (auto_init is async).
      */
+    /**
+     * Repo name to use when the connector doesn't have one configured —
+     * prefers the project's slug (already a clean, GitHub-safe identifier:
+     * lowercase, hyphenated, no spaces — see the frontend's slug generator),
+     * falls back to sanitising the display name, and finally to a
+     * guaranteed-unique "mcp-server-{id}" so this never blocks a push.
+     */
+    private String deriveRepoNameFromProject(McpProject mcp) {
+        McpProject.Identity id = mcp.getIdentity();
+        if (id != null && id.getSlug() != null && !id.getSlug().isBlank()) {
+            return id.getSlug().trim();
+        }
+        if (id != null && id.getDisplayName() != null && !id.getDisplayName().isBlank()) {
+            String sanitised = id.getDisplayName().toLowerCase().trim()
+                    .replaceAll("[^a-z0-9]+", "-")
+                    .replaceAll("^-+|-+$", "");
+            if (!sanitised.isBlank()) return sanitised;
+        }
+        String suffix = mcp.getId() != null ? mcp.getId() : UUID.randomUUID().toString();
+        return "mcp-server-" + suffix;
+    }
+
     private void ensureRepoExists(String orgOrUser, String repo, String branch, String token, org.bson.Document scm) {
         java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
 
