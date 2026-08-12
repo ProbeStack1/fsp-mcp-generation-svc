@@ -187,11 +187,15 @@ public class JavaSpringGenerator implements CodeGenerator {
         // Senior dev's pipeline picks this workflow up — pushes the
         // image to the registry and rolls out a deploy. Same shape
         // across all languages.
-        files.add(GeneratedFile.builder()
-                .path(".github/workflows/mcp.yml")
-                .content(GeneratorUtils.buildGithubWorkflow(spec))
-                .mimeHint("text/yaml")
-                .build());
+        {
+            String workflowYml = GeneratorUtils.buildGithubWorkflow(spec);
+            files.add(GeneratedFile.builder()
+                    .path(".github/workflows/mcp.yml")
+                    .content(workflowYml)
+                    .bytes(workflowYml == null ? 0 : workflowYml.getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
+                    .mimeHint("text/yaml")
+                    .build());
+        }
 
         return files;
     }

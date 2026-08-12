@@ -335,29 +335,43 @@ public class MicroserviceBridgeService {
         }
         String token     = scm.getString("token");
         String orgOrUser = scm.getString("orgOrUser");
-        String repo      = scm.getString("repo");
         String branch    = scm.getString("branch");
         if (token == null || token.isBlank()) throw new IllegalStateException("Connector has no GitHub token.");
         if (orgOrUser == null || orgOrUser.isBlank()) throw new IllegalStateException("Connector has no orgOrUser.");
         if (branch == null || branch.isBlank()) branch = "main";
 
-        // ─── No repo name configured on the connector? Derive one from
-        // the MCP project itself (same behaviour the user expects from the
-        // microservice flow: generate → create a repo named after the
-        // service → push) instead of failing the push. Persisted back onto
-        // the connector so every later push targets the SAME repo, rather
-        // than re-deriving (and potentially creating a new one) each time.
-        if (repo == null || repo.isBlank()) {
-            repo = deriveRepoNameFromProject(mcp);
-            log.info("[push] connector has no repo configured — derived '{}' from the project", repo);
-            try {
-                scm.put("repo", repo);
-                conn.put("sourceCodeManagement", scm);
-                bridgeColl(props.getColl().getConnector()).replaceOne(
-                        new org.bson.Document("_id", parseIdMaybe(connectorId)), conn);
-            } catch (Exception e) {
-                log.warn("[push] failed to persist derived repo name onto connector {}: {}",
-                        connectorId, e.getMessage());
+        // ─── Resolve repo name — collision-safe, per-PROJECT ──────────
+        // Two rules:
+        //   1. This exact project already pushed before → ALWAYS reuse
+        //      the same repo it used last time (a regenerate must land
+        //      back in the same place), regardless of what the connector
+        //      or derivation would produce now.
+        //   2. First-ever push for this project → derive a candidate
+        //      name (connector's explicit repo if set, else the
+        //      project's slug/displayName/id) and check GitHub for a
+        //      collision. A connector is often SHARED across multiple
+        //      MCP projects, so persisting one project's derived name
+        //      onto the shared connector (the old behaviour) meant a
+        //      second, unrelated service with the same/derived name
+        //      would silently land inside the FIRST project's repo. If
+        //      the candidate is already taken, keep appending "-2",
+        //      "-3", … until a free name is found — never push into an
+        //      existing repo this project didn't itself create.
+        String repo;
+        if (mcp.getPushedRepoFullName() != null && !mcp.getPushedRepoFullName().isBlank()) {
+            String[] parts = mcp.getPushedRepoFullName().split("/", 2);
+            repo = parts.length == 2 ? parts[1] : mcp.getPushedRepoFullName();
+            log.info("[push] project {} already has a repo — reusing '{}'", mcp.getId(), repo);
+        } else {
+            String explicit = scm.getString("repo");
+            String candidate = (explicit != null && !explicit.isBlank())
+                    ? explicit : deriveRepoNameFromProject(mcp);
+            repo = resolveCollisionFreeRepoName(orgOrUser, candidate, token);
+            if (!repo.equals(candidate)) {
+                log.info("[push] '{}' already exists under {} — using '{}' instead so we don't overwrite an unrelated repo",
+                        candidate, orgOrUser, repo);
+            } else {
+                log.info("[push] resolved repo name '{}' for project {}", repo, mcp.getId());
             }
         }
 
@@ -633,6 +647,42 @@ public class MicroserviceBridgeService {
         }
         String suffix = mcp.getId() != null ? mcp.getId() : UUID.randomUUID().toString();
         return "mcp-server-" + suffix;
+    }
+
+    /**
+     * Returns {@code candidate} unchanged if no repo by that name exists
+     * yet under {@code orgOrUser}; otherwise keeps appending "-2", "-3", …
+     * until it finds a free one. Best-effort: if the existence check
+     * itself fails (network hiccup), treats the name as free rather than
+     * blocking the push — worst case is the ordinary "repo already
+     * exists, reuse it" path in {@link #ensureRepoExists}, not data loss.
+     */
+    private String resolveCollisionFreeRepoName(String orgOrUser, String candidate, String token) {
+        String base = (candidate == null || candidate.isBlank()) ? "mcp-server" : candidate.trim();
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        String name = base;
+        for (int n = 2; n <= 50; n++) {
+            if (!repoExistsOnGithub(http, orgOrUser, name, token)) return name;
+            name = base + "-" + n;
+        }
+        // Extremely unlikely (50 collisions in a row) — fall back to a
+        // guaranteed-unique suffix rather than looping forever.
+        return base + "-" + UUID.randomUUID().toString().substring(0, 8);
+    }
+
+    private boolean repoExistsOnGithub(java.net.http.HttpClient http, String orgOrUser, String repo, String token) {
+        try {
+            var get = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create("https://api.github.com/repos/" + orgOrUser + "/" + repo))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var resp = http.send(get, java.net.http.HttpResponse.BodyHandlers.ofString());
+            return resp.statusCode() == 200;
+        } catch (Exception e) {
+            log.warn("[push] repo-exists check failed for {}/{}: {}", orgOrUser, repo, e.getMessage());
+            return false;
+        }
     }
 
     private void ensureRepoExists(String orgOrUser, String repo, String branch, String token, org.bson.Document scm) {

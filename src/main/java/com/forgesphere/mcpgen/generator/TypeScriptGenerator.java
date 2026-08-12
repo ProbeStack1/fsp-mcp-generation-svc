@@ -172,11 +172,19 @@ public class TypeScriptGenerator implements CodeGenerator {
         //  dev's pipeline picks this workflow up — pushes the
         // image to the registry and rolls out a deploy. Same shape
         // across all languages.
-        files.add(GeneratedFile.builder()
-                .path(".github/workflows/mcp.yml")
-                .content(GeneratorUtils.buildGithubWorkflow(spec))
-                .mimeHint("text/yaml")
-                .build());
+        {
+            // Built via GeneratedFile.builder() directly (not the file()
+            // helper below), so `.bytes()` was never set — it silently
+            // defaulted to 0 and every generate() response reported this
+            // file as empty even though its real content was pushed fine.
+            String workflowYml = GeneratorUtils.buildGithubWorkflow(spec);
+            files.add(GeneratedFile.builder()
+                    .path(".github/workflows/mcp.yml")
+                    .content(workflowYml)
+                    .bytes(workflowYml == null ? 0 : workflowYml.getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
+                    .mimeHint("text/yaml")
+                    .build());
+        }
 
         return files;
     }
@@ -521,7 +529,26 @@ public class TypeScriptGenerator implements CodeGenerator {
         return GeneratedFile.builder().path(path).content(content).bytes(bytes.length).mimeHint(hint).build();
     }
 
-    private static String quote(String s) { return "\"" + (s == null ? "" : s.replace("\\","\\\\").replace("\"","\\\"")) + "\""; }
+    /**
+     * Builds a double-quoted TS string literal. Beyond backslash/quote,
+     * MUST also escape raw control chars — tool/resource/prompt
+     * descriptions are frequently AI-synthesized (Step 3 "Synthesize")
+     * or hand-typed in a multi-line textarea, and a literal '\n' embedded
+     * directly in a double-quoted string is invalid JS/TS ("Unterminated
+     * string literal") — it silently corrupts server.ts at compile/build
+     * time (caught as a Docker build failure, not at generate-time).
+     */
+    private static String quote(String s) {
+        if (s == null) return "\"\"";
+        String escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r\n", "\\n")
+                .replace("\n", "\\n")
+                .replace("\r", "\\n")
+                .replace("\t", "\\t");
+        return "\"" + escaped + "\"";
+    }
     private static String nz(String s)   { return s == null ? "" : s; }
     private static String escapeBacktick(String s) { return s == null ? "" : s.replace("`","\\`").replace("$","\\$"); }
 

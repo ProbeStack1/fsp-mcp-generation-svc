@@ -142,11 +142,15 @@ public class PythonGenerator implements CodeGenerator {
         // Senior dev's pipeline picks this workflow up — pushes the
         // image to the registry and rolls out a deploy. Same shape
         // across all languages.
-        files.add(GeneratedFile.builder()
-                .path(".github/workflows/mcp.yml")
-                .content(GeneratorUtils.buildGithubWorkflow(spec))
-                .mimeHint("text/yaml")
-                .build());
+        {
+            String workflowYml = GeneratorUtils.buildGithubWorkflow(spec);
+            files.add(GeneratedFile.builder()
+                    .path(".github/workflows/mcp.yml")
+                    .content(workflowYml)
+                    .bytes(workflowYml == null ? 0 : workflowYml.getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
+                    .mimeHint("text/yaml")
+                    .build());
+        }
 
         return files;
     }
@@ -185,6 +189,24 @@ public class PythonGenerator implements CodeGenerator {
         return GeneratedFile.builder().path(path).content(content).bytes(content.getBytes().length).mimeHint(hint).build();
     }
 
-    private static String quote(String s) { return "\"" + (s == null ? "" : s.replace("\"","\\\"")) + "\""; }
+    /**
+     * Builds a double-quoted Python string literal. Same bug class as
+     * TypeScriptGenerator's quote(): missing backslash escaping (an
+     * unescaped trailing '\' can eat the closing quote) AND missing
+     * control-char escaping (a raw newline in an AI-synthesized or
+     * multi-line description breaks the single-quoted-string across
+     * lines — invalid Python syntax at build/run time).
+     */
+    private static String quote(String s) {
+        if (s == null) return "\"\"";
+        String escaped = s
+                .replace("\\", "\\\\")
+                .replace("\"", "\\\"")
+                .replace("\r\n", "\\n")
+                .replace("\n", "\\n")
+                .replace("\r", "\\n")
+                .replace("\t", "\\t");
+        return "\"" + escaped + "\"";
+    }
     private static String nz(String s) { return s == null ? "" : s; }
 }

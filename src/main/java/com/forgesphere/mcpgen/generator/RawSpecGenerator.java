@@ -58,11 +58,15 @@ public class RawSpecGenerator implements CodeGenerator {
         // Senior dev's pipeline picks this workflow up — even raw bundles
         // get a manifest-only validation workflow so push-to-deploy still
         // produces a green check-mark in the platform UI.
-        out.add(GeneratedFile.builder()
-                .path(".github/workflows/mcp.yml")
-                .content(GeneratorUtils.buildGithubWorkflow(spec))
-                .mimeHint("text/yaml")
-                .build());
+        {
+            String workflowYml = GeneratorUtils.buildGithubWorkflow(spec);
+            out.add(GeneratedFile.builder()
+                    .path(".github/workflows/mcp.yml")
+                    .content(workflowYml)
+                    .bytes(workflowYml == null ? 0 : workflowYml.getBytes(java.nio.charset.StandardCharsets.UTF_8).length)
+                    .mimeHint("text/yaml")
+                    .build());
+        }
 
         return out;
     }
