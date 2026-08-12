@@ -1354,6 +1354,23 @@ public class MicroserviceBridgeService {
                 };
             }
 
+            // On a fresh SUCCESS, pull the Cloud Run URL out of the
+            // "deployment-url" artifact the workflow uploads (see
+            // mcp.yml's "Upload Deployed URL Artifact" step) — this is
+            // the ONLY place that URL exists; Cloud Run assigns it at
+            // deploy time and it can't be predicted/derived beforehand.
+            // Without this, `deployedServiceUrl` was NEVER populated by
+            // anything and the UI could never show it.
+            if ("SUCCESS".equals(deployStatus)
+                    && (project.getDeployedServiceUrl() == null || project.getDeployedServiceUrl().isBlank())) {
+                String fetchedUrl = fetchDeployedUrlFromArtifact(
+                        creds.orgOrUser, creds.repo, String.valueOf(firstRun.get("id")), creds.token);
+                if (fetchedUrl != null && !fetchedUrl.isBlank()) {
+                    project.setDeployedServiceUrl(fetchedUrl);
+                    project.setDeployedAt(java.time.Instant.now());
+                }
+            }
+
             // Persist key fields onto McpProject so the dashboard /
             // listings have up-to-date workflow state too.
             try {
@@ -1379,6 +1396,67 @@ public class MicroserviceBridgeService {
         } catch (Exception e) {
             log.warn("[runs] latest-run lookup failed: {}", e.getMessage());
             return Map.of("runFound", false, "error", e.getMessage());
+        }
+    }
+
+    /**
+     * Downloads the workflow's "deployment-url" artifact (a small zip
+     * containing {@code .deploy-url.json}, written by mcp.yml's "Save
+     * Deployed URL as Artifact File" step) and extracts the Cloud Run
+     * service URL. Three GitHub API calls: list artifacts for the run →
+     * find the one named "deployment-url" → download + unzip it.
+     * Best-effort — returns null on any failure (artifact not ready yet,
+     * expired, workflow predates this artifact step, parse error) so a
+     * hiccup here never breaks status polling.
+     */
+    private String fetchDeployedUrlFromArtifact(String orgOrUser, String repo, String runId, String token) {
+        if (runId == null || runId.isBlank()) return null;
+        try {
+            java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+            String listUrl = "https://api.github.com/repos/" + orgOrUser + "/" + repo
+                    + "/actions/runs/" + runId + "/artifacts";
+            var listReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(listUrl))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var listResp = http.send(listReq, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (listResp.statusCode() != 200) return null;
+
+            com.fasterxml.jackson.databind.JsonNode root =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(listResp.body());
+            String downloadUrl = null;
+            for (var a : root.path("artifacts")) {
+                if ("deployment-url".equals(a.path("name").asText(null))) {
+                    downloadUrl = a.path("archive_download_url").asText(null);
+                    break;
+                }
+            }
+            if (downloadUrl == null || downloadUrl.isBlank()) return null;
+
+            var dlReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(downloadUrl))
+                    .header("Authorization", "Bearer " + token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var dlResp = http.send(dlReq, java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            if (dlResp.statusCode() != 200) return null;
+
+            try (var zin = new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(dlResp.body()))) {
+                java.util.zip.ZipEntry entry;
+                while ((entry = zin.getNextEntry()) != null) {
+                    if (entry.getName().endsWith(".deploy-url.json")) {
+                        byte[] content = zin.readAllBytes();
+                        com.fasterxml.jackson.databind.JsonNode urlJson =
+                                new com.fasterxml.jackson.databind.ObjectMapper().readTree(content);
+                        String svcUrl = urlJson.path("url").asText(null);
+                        if (svcUrl != null && !svcUrl.isBlank()) return svcUrl;
+                    }
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            log.warn("[runs] fetchDeployedUrlFromArtifact failed for {}/{} run={}: {}",
+                    orgOrUser, repo, runId, e.getMessage());
+            return null;
         }
     }
 

@@ -10,6 +10,7 @@ import com.forgesphere.mcpgen.service.MicroserviceBridgeService;
 import lombok.RequiredArgsConstructor;
 import lombok.extern.slf4j.Slf4j;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Lazy;
 import org.springframework.data.mongodb.core.MongoTemplate;
 import org.springframework.data.mongodb.core.query.Criteria;
@@ -42,6 +43,15 @@ public class McpGenerationService {
     @Lazy
     @Autowired
     private MicroserviceBridgeService bridgeService; // Lazy to break circular dependency
+
+    // Same property GcsStorageClient itself binds to (see
+    // StorageProperties/StorageAutoConfiguration) — needed here because
+    // StoredObject.objectPath is a BARE key ("mcp-zips/…"), not a full
+    // "gs://bucket/…" URI, but codegen_results.gcsArchivePath must be
+    // the full URI or senior's contract-testing/analysis/peer-review
+    // BundleDownloadService rejects it with "Invalid GCS path".
+    @Value("${forgesphere.storage.bucket:}")
+    private String storageBucket;
 
     // ---- NEW: save method (used by bundle builder) ----
     public McpProject save(McpProject p) {
@@ -570,13 +580,21 @@ public class McpGenerationService {
     private void mirrorIntoCodegenResults(McpProject p) {
         if (mongoTemplate == null || p.getZipObjectPath() == null) return;
         try {
-            String gcsPath = p.getZipObjectPath();
-            // The storage abstraction stores either "gs://bucket/key" or
-            // a local fallback "file:///tmp/...". Senior's GCS-only
-            // downloader needs the gs:// form — if we're on local mode
-            // we still write the record so non-prod runs are visible
-            // in the catalog query; senior's parseGcsPath will surface
-            // a clear 400 instead of returning silent garbage.
+            // BUG FIX: `p.getZipObjectPath()` is a BARE object key (e.g.
+            // "mcp-zips/{id}/mcp-server.zip") — StoredObject keeps bucket
+            // and objectPath as separate fields, upload() never returns a
+            // combined URI. Writing that bare key straight into
+            // `gcsArchivePath` is exactly what caused
+            // "Invalid GCS path: mcp-zips/…/mcp-server.zip" from Code
+            // Analysis (and any other senior service reading this row) —
+            // their parser expects a full "gs://bucket/key" URI. Prefix it
+            // ourselves when we know the bucket (real GCS); on local-disk
+            // fallback (no bucket configured) leave the bare key as-is —
+            // that path never reaches a real GCS-backed consumer anyway.
+            String gcsPath = (storageBucket != null && !storageBucket.isBlank()
+                    && !p.getZipObjectPath().startsWith("gs://"))
+                    ? "gs://" + storageBucket + "/" + p.getZipObjectPath()
+                    : p.getZipObjectPath();
             String fileName = slugForZip(p) + ".zip";
             Update u = new Update()
                     .set("microserviceId",  p.getId())

@@ -312,6 +312,15 @@ public class McpProjectController {
     @PostMapping("/{id}/generate")
     public Envelope<GenerateResponse> generate(@PathVariable String id) {
         McpProject p = svc.generate(id);
+        // Build + upload the scenario-based test collection right away so
+        // Step 8 (Test Cases) has a URL immediately after Step 7 — it used
+        // to only get built as a side-effect of downloading the full
+        // bundle at Step 11, which nothing before it ever triggered.
+        // Best-effort: never let a test-collection hiccup fail /generate.
+        try {
+            bundleBuilder.uploadTestCollection(p);
+            p = svc.get(id).orElse(p);
+        } catch (Exception ignored) { /* toGenerateResponse just omits the URL */ }
         return Envelope.ok(toGenerateResponse(p));
     }
 

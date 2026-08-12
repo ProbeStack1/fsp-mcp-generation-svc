@@ -109,28 +109,7 @@ public class McpBundleBuilder {
                 project.getId(), bytes.length, fileCount, stored.getObjectPath());
 
         // ---- NEW: Upload test collection as a separate JSON artifact ----
-        String testCollectionKey = "test-collections/" + project.getId() + "/" + UUID.randomUUID() + ".json";
-        Map<String, String> testData = testCollectionGenerator.generate(project);
-        Map<String, Object> combined = new LinkedHashMap<>();
-        combined.put("postmanCollection", testData.get("postmanCollection"));
-        combined.put("scenarioMetadata", testData.get("scenarioMetadata"));
-        String combinedJson;
-        try {
-            combinedJson = json.writeValueAsString(combined);
-        } catch (Exception e) {
-            combinedJson = "{}";
-        }
-        StoredObject testStored = storage.upload(testCollectionKey, combinedJson.getBytes(), "application/json");
-        URL testUrl = storage.signedDownloadUrl(testCollectionKey, Duration.ofDays(7));
-        String testCollectionUrl = testUrl != null ? testUrl.toString() : null;
-        if (testCollectionUrl != null) {
-            if (project.getGenerated() == null) {
-                project.setGenerated(McpProject.Generated.builder().build());
-            }
-            project.getGenerated().setTestCollectionUrl(testCollectionUrl);
-            // Persist the updated project so the URL is saved
-            genSvc.save(project);
-        }
+        uploadTestCollection(project);
 
         // ──────────────────────────────────────────────────────────
         // Mirror the freshly-uploaded zip into `codegen_results` so
@@ -142,6 +121,48 @@ public class McpBundleBuilder {
         // ──────────────────────────────────────────────────────────
         mirrorIntoCodegenResults(project, stored.getObjectPath(), fileName);
         return new Bundle(bytes, stored.getObjectPath(), fileName, fileCount, bytes.length);
+    }
+
+    /**
+     * Builds + uploads JUST the scenario-based test collection (Postman
+     * collection + scenario metadata) and stamps the resulting signed
+     * URL onto {@code project.generated.testCollectionUrl}. Split out of
+     * {@link #buildAndStore} so Step 8 (Test Cases) can get a URL right
+     * after Step 7's plain {@code /generate} call — it used to only ever
+     * get built as a side-effect of downloading the FULL "everything"
+     * bundle at Step 11, which nothing in the wizard actually triggered
+     * before that step, so Step 8 always saw "no test collection URL".
+     * Best-effort: returns the existing URL (or null) on any failure so
+     * a hiccup here never breaks generation.
+     */
+    public String uploadTestCollection(McpProject project) {
+        try {
+            String testCollectionKey = "test-collections/" + project.getId() + "/" + UUID.randomUUID() + ".json";
+            Map<String, String> testData = testCollectionGenerator.generate(project);
+            Map<String, Object> combined = new LinkedHashMap<>();
+            combined.put("postmanCollection", testData.get("postmanCollection"));
+            combined.put("scenarioMetadata", testData.get("scenarioMetadata"));
+            String combinedJson;
+            try {
+                combinedJson = json.writeValueAsString(combined);
+            } catch (Exception e) {
+                combinedJson = "{}";
+            }
+            storage.upload(testCollectionKey, combinedJson.getBytes(StandardCharsets.UTF_8), "application/json");
+            URL testUrl = storage.signedDownloadUrl(testCollectionKey, Duration.ofDays(7));
+            String testCollectionUrl = testUrl != null ? testUrl.toString() : null;
+            if (testCollectionUrl != null) {
+                if (project.getGenerated() == null) {
+                    project.setGenerated(McpProject.Generated.builder().build());
+                }
+                project.getGenerated().setTestCollectionUrl(testCollectionUrl);
+                genSvc.save(project);
+            }
+            return testCollectionUrl;
+        } catch (Exception e) {
+            log.warn("Failed to build test collection for project {}: {}", project.getId(), e.getMessage());
+            return project.getGenerated() != null ? project.getGenerated().getTestCollectionUrl() : null;
+        }
     }
 
     /**
