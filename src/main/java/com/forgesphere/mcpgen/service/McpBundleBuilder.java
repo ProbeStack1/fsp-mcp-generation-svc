@@ -138,10 +138,28 @@ public class McpBundleBuilder {
     public String uploadTestCollection(McpProject project) {
         try {
             String testCollectionKey = "test-collections/" + project.getId() + "/" + UUID.randomUUID() + ".json";
+            // testCollectionGenerator.generate() returns each field as an
+            // ALREADY JSON-STRINGIFIED string (that's what writeTestCollection()
+            // needs — it writes them out as standalone .json files in the
+            // full bundle). Putting those strings straight into `combined`
+            // and then writeValueAsString()-ing the whole map double-encodes
+            // them: the stored artifact ended up as
+            // {"scenarioMetadata": "[{...}]"} (a STRING containing JSON
+            // text) instead of {"scenarioMetadata": [{...}]} (a real
+            // array) — exactly what made the frontend's
+            // `scenarioMetadata.map()` blow up with "is not a function".
+            // Parse them back into real trees before combining.
             Map<String, String> testData = testCollectionGenerator.generate(project);
             Map<String, Object> combined = new LinkedHashMap<>();
-            combined.put("postmanCollection", testData.get("postmanCollection"));
-            combined.put("scenarioMetadata", testData.get("scenarioMetadata"));
+            try {
+                combined.put("postmanCollection", json.readTree(testData.get("postmanCollection")));
+                combined.put("scenarioMetadata", json.readTree(testData.get("scenarioMetadata")));
+            } catch (Exception parseEx) {
+                log.warn("Failed to parse generated test data as JSON for project {}: {}",
+                        project.getId(), parseEx.getMessage());
+                combined.put("postmanCollection", Map.of());
+                combined.put("scenarioMetadata", List.of());
+            }
             String combinedJson;
             try {
                 combinedJson = json.writeValueAsString(combined);
