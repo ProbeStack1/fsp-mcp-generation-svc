@@ -79,6 +79,16 @@ public class McpProject {
     private String  specSource;   // 'library' | 'imported' | etc — same values Step 3 already uses
 
     /**
+     * GCS object key (NOT the transient signed URL — that lives on
+     * {@code generated.testCollectionUrl} and never survives a reload) of
+     * the last scenario-based test collection built for this project.
+     * Persisted so Step 8 can be fetched fresh through our own backend
+     * (see {@code GET /projects/{id}/test-collection}) any time, in any
+     * session, instead of only right after a same-session generate.
+     */
+    private String  testCollectionObjectKey;
+
+    /**
      * Pointer to the persisted ZIP in object storage (set after first
      * download). Allows users to re-download from any device without
      * regenerating.

@@ -308,6 +308,24 @@ public class McpProjectController {
                 .body(new ByteArrayResource(bundle.content()));
     }
 
+    /**
+     * Step 8's own fetch — proxies the test-collection JSON through us
+     * instead of the browser hitting the GCS signed URL directly (that
+     * bucket has no CORS rule for our frontend origin, so a direct
+     * browser fetch always failed with "Failed to fetch"). Self-heals:
+     * builds a fresh test collection first if this project has never
+     * had one, so it works the very first time Step 8 is opened too.
+     */
+    @GetMapping("/{id}/test-collection")
+    public ResponseEntity<byte[]> testCollection(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        byte[] bytes = bundleBuilder.downloadTestCollection(p);
+        if (bytes == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.ok().contentType(MediaType.APPLICATION_JSON).body(bytes);
+    }
+
     // ------------- Generation -------------
     @PostMapping("/{id}/generate")
     public Envelope<GenerateResponse> generate(@PathVariable String id) {

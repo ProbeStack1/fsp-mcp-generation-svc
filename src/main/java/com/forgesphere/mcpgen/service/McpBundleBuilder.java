@@ -151,18 +151,44 @@ public class McpBundleBuilder {
             storage.upload(testCollectionKey, combinedJson.getBytes(StandardCharsets.UTF_8), "application/json");
             URL testUrl = storage.signedDownloadUrl(testCollectionKey, Duration.ofDays(7));
             String testCollectionUrl = testUrl != null ? testUrl.toString() : null;
-            if (testCollectionUrl != null) {
-                if (project.getGenerated() == null) {
-                    project.setGenerated(McpProject.Generated.builder().build());
-                }
-                project.getGenerated().setTestCollectionUrl(testCollectionUrl);
-                genSvc.save(project);
+            if (project.getGenerated() == null) {
+                project.setGenerated(McpProject.Generated.builder().build());
             }
+            if (testCollectionUrl != null) {
+                project.getGenerated().setTestCollectionUrl(testCollectionUrl);
+            }
+            // Persisted (non-transient) pointer — this is what
+            // GET /projects/{id}/test-collection reads on every future
+            // request, regardless of session, so Step 8 never depends on
+            // the signed URL above surviving a reload.
+            project.setTestCollectionObjectKey(testCollectionKey);
+            genSvc.save(project);
             return testCollectionUrl;
         } catch (Exception e) {
             log.warn("Failed to build test collection for project {}: {}", project.getId(), e.getMessage());
             return project.getGenerated() != null ? project.getGenerated().getTestCollectionUrl() : null;
         }
+    }
+
+    /**
+     * Downloads the raw test-collection JSON bytes for a project —
+     * builds one fresh first if it's never had one. Backs
+     * {@code GET /projects/{id}/test-collection}, which exists so the
+     * browser never has to fetch the GCS signed URL directly: that
+     * bucket has no CORS rule for our frontend's origin, so a direct
+     * `fetch(signedUrl)` from the browser always failed with a bare
+     * "Failed to fetch" even though the URL itself was valid (200 in
+     * the Network tab — the browser just refused to hand the response
+     * to JS). A same-origin call to our own API has no such problem.
+     */
+    public byte[] downloadTestCollection(McpProject project) {
+        if (project.getTestCollectionObjectKey() == null || project.getTestCollectionObjectKey().isBlank()) {
+            uploadTestCollection(project);
+        }
+        if (project.getTestCollectionObjectKey() == null || project.getTestCollectionObjectKey().isBlank()) {
+            return null;
+        }
+        return storage.download(project.getTestCollectionObjectKey());
     }
 
     /**
