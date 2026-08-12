@@ -132,6 +132,9 @@ public class McpGenerationService {
         if (patch.getConnectorId()  != null) cur.setConnectorId(patch.getConnectorId());
         if (patch.getOnboarding()   != null) cur.setOnboarding(patch.getOnboarding());
         if (patch.getSource()       != null) cur.setSource(patch.getSource());
+        if (patch.getSpecMetadataId() != null) cur.setSpecMetadataId(patch.getSpecMetadataId());
+        if (patch.getSpecName()       != null) cur.setSpecName(patch.getSpecName());
+        if (patch.getSpecSource()     != null) cur.setSpecSource(patch.getSpecSource());
         cur.setUpdatedAt(Instant.now());
         return repo.save(cur);
     }

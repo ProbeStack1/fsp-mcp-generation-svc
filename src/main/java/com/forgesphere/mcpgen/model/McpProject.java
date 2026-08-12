@@ -65,6 +65,20 @@ public class McpProject {
     @Indexed private String source;
 
     /**
+     * Pointer back to the OpenAPI spec (in apiDesignService's own store)
+     * that Step 3's capabilities were parsed from. The spec upload/select
+     * itself always succeeds and the file stays in apiDesignService —
+     * this project doc just never remembered WHICH one, so reopening the
+     * wizard had no way to re-fetch the content for re-linting even
+     * though it was never actually deleted. Saved alongside `capabilities`
+     * so Step 4 can call apiDesignService.getSpecContent(specMetadataId)
+     * again on resume instead of only showing the already-parsed result.
+     */
+    private String  specMetadataId;
+    private String  specName;
+    private String  specSource;   // 'library' | 'imported' | etc — same values Step 3 already uses
+
+    /**
      * Pointer to the persisted ZIP in object storage (set after first
      * download). Allows users to re-download from any device without
      * regenerating.
