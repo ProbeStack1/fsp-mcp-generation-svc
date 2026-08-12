@@ -1297,6 +1297,27 @@ public class MicroserviceBridgeService {
         }
     }
 
+    // Same hardcoded suffix as the frontend's lib/deploymentUrl.js
+    // (MICROSERVICE_CLOUD_RUN_SUFFIX) — every service in probestack-prod/
+    // us-central1 (microservice OR MCP) gets this exact Cloud Run URL
+    // hash, since it's derived from the PROJECT+REGION, not the service.
+    private static final String MCP_CLOUD_RUN_SUFFIX = "spipnh6wiq-uc.a.run.app";
+
+    /**
+     * Constructs the expected Cloud Run URL from the project's slug —
+     * instant, no network call, no waiting on GitHub Actions. Returns
+     * null when there's no slug to build from (identity never filled in),
+     * which is the only case that still needs the artifact-based fetch.
+     */
+    private String buildDeployedUrlFromSlug(McpProject project) {
+        if (project.getIdentity() == null || project.getIdentity().getSlug() == null) return null;
+        String normalized = project.getIdentity().getSlug().toLowerCase().trim()
+                .replaceAll("[^a-z0-9-]+", "-")
+                .replaceAll("^-+|-+$", "");
+        if (normalized.isBlank()) return null;
+        return "https://" + normalized + "-" + MCP_CLOUD_RUN_SUFFIX;
+    }
+
     // ────────────────────────────────────────────────────────────────────
     // Workflow-run lookups — replaces senior's api-development endpoint
     // which is currently broken by a GCS uniform-bucket-level-access
@@ -1354,34 +1375,43 @@ public class MicroserviceBridgeService {
                 };
             }
 
-            // On a fresh SUCCESS, pull the Cloud Run URL out of the
-            // "deployment-url" artifact the workflow uploads (see
-            // mcp.yml's "Upload Deployed URL Artifact" step) — this is
-            // the ONLY place that URL exists; Cloud Run assigns it at
-            // deploy time and it can't be predicted/derived beforehand.
-            // Without this, `deployedServiceUrl` was NEVER populated by
-            // anything and the UI could never show it.
+            // On a fresh SUCCESS, set the deployed URL IMMEDIATELY by
+            // constructing it — same approach as the frontend's
+            // lib/deploymentUrl.js (MICROSERVICE_CLOUD_RUN_SUFFIX):
+            // Cloud Run's URL hash is derived from the PROJECT+REGION,
+            // not the individual service, so it's identical for every
+            // service deployed to probestack-prod/us-central1 and can be
+            // built from the slug alone the instant the run reports
+            // success — no need to wait on (or even call) the GitHub
+            // Actions artifact API. Only falls back to the slower
+            // artifact-based fetch when there's no slug to construct
+            // from at all.
             if ("SUCCESS".equals(deployStatus)
                     && (project.getDeployedServiceUrl() == null || project.getDeployedServiceUrl().isBlank())) {
-                DeployedUrls fetched = fetchDeployedUrlFromArtifact(
-                        creds.orgOrUser, creds.repo, String.valueOf(firstRun.get("id")), creds.token);
-                if (fetched != null && fetched.url() != null && !fetched.url().isBlank()) {
-                    String base = fetched.url().replaceAll("/+$", "");
-                    // The artifact JSON normally carries mcpUrl/healthUrl
-                    // pre-computed, but fall back to plain concatenation
-                    // (same convention every generated server follows —
-                    // "<base>/mcp" and "<base><healthCheck.path>") if an
-                    // older workflow run's artifact predates those fields.
-                    String healthPath = project.getAdvanced() != null && project.getAdvanced().getHealthCheck() != null
-                            && project.getAdvanced().getHealthCheck().getPath() != null
-                            && !project.getAdvanced().getHealthCheck().getPath().isBlank()
-                            ? project.getAdvanced().getHealthCheck().getPath() : "/healthz";
-                    project.setDeployedServiceUrl(base);
-                    project.setDeployedMcpUrl(fetched.mcpUrl() != null && !fetched.mcpUrl().isBlank()
-                            ? fetched.mcpUrl() : base + "/mcp");
-                    project.setDeployedHealthUrl(fetched.healthUrl() != null && !fetched.healthUrl().isBlank()
-                            ? fetched.healthUrl() : base + healthPath);
+                String healthPath = project.getAdvanced() != null && project.getAdvanced().getHealthCheck() != null
+                        && project.getAdvanced().getHealthCheck().getPath() != null
+                        && !project.getAdvanced().getHealthCheck().getPath().isBlank()
+                        ? project.getAdvanced().getHealthCheck().getPath() : "/healthz";
+                String constructedBase = buildDeployedUrlFromSlug(project);
+                if (constructedBase != null) {
+                    project.setDeployedServiceUrl(constructedBase);
+                    project.setDeployedMcpUrl(constructedBase + "/mcp");
+                    project.setDeployedHealthUrl(constructedBase + healthPath);
                     project.setDeployedAt(java.time.Instant.now());
+                } else {
+                    // No slug on this project — the only remaining way to
+                    // learn the URL is the workflow's own artifact.
+                    DeployedUrls fetched = fetchDeployedUrlFromArtifact(
+                            creds.orgOrUser, creds.repo, String.valueOf(firstRun.get("id")), creds.token);
+                    if (fetched != null && fetched.url() != null && !fetched.url().isBlank()) {
+                        String base = fetched.url().replaceAll("/+$", "");
+                        project.setDeployedServiceUrl(base);
+                        project.setDeployedMcpUrl(fetched.mcpUrl() != null && !fetched.mcpUrl().isBlank()
+                                ? fetched.mcpUrl() : base + "/mcp");
+                        project.setDeployedHealthUrl(fetched.healthUrl() != null && !fetched.healthUrl().isBlank()
+                                ? fetched.healthUrl() : base + healthPath);
+                        project.setDeployedAt(java.time.Instant.now());
+                    }
                 }
             }
 
