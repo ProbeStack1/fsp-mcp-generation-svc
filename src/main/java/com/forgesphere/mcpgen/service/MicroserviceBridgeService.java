@@ -1363,10 +1363,24 @@ public class MicroserviceBridgeService {
             // anything and the UI could never show it.
             if ("SUCCESS".equals(deployStatus)
                     && (project.getDeployedServiceUrl() == null || project.getDeployedServiceUrl().isBlank())) {
-                String fetchedUrl = fetchDeployedUrlFromArtifact(
+                DeployedUrls fetched = fetchDeployedUrlFromArtifact(
                         creds.orgOrUser, creds.repo, String.valueOf(firstRun.get("id")), creds.token);
-                if (fetchedUrl != null && !fetchedUrl.isBlank()) {
-                    project.setDeployedServiceUrl(fetchedUrl);
+                if (fetched != null && fetched.url() != null && !fetched.url().isBlank()) {
+                    String base = fetched.url().replaceAll("/+$", "");
+                    // The artifact JSON normally carries mcpUrl/healthUrl
+                    // pre-computed, but fall back to plain concatenation
+                    // (same convention every generated server follows —
+                    // "<base>/mcp" and "<base><healthCheck.path>") if an
+                    // older workflow run's artifact predates those fields.
+                    String healthPath = project.getAdvanced() != null && project.getAdvanced().getHealthCheck() != null
+                            && project.getAdvanced().getHealthCheck().getPath() != null
+                            && !project.getAdvanced().getHealthCheck().getPath().isBlank()
+                            ? project.getAdvanced().getHealthCheck().getPath() : "/healthz";
+                    project.setDeployedServiceUrl(base);
+                    project.setDeployedMcpUrl(fetched.mcpUrl() != null && !fetched.mcpUrl().isBlank()
+                            ? fetched.mcpUrl() : base + "/mcp");
+                    project.setDeployedHealthUrl(fetched.healthUrl() != null && !fetched.healthUrl().isBlank()
+                            ? fetched.healthUrl() : base + healthPath);
                     project.setDeployedAt(java.time.Instant.now());
                 }
             }
@@ -1390,6 +1404,8 @@ public class MicroserviceBridgeService {
             out.put("deploymentStatus", deployStatus);
             if (project.getDeployedServiceUrl() != null) {
                 out.put("deployedServiceUrl", project.getDeployedServiceUrl());
+                if (project.getDeployedMcpUrl() != null) out.put("deployedMcpUrl", project.getDeployedMcpUrl());
+                if (project.getDeployedHealthUrl() != null) out.put("deployedHealthUrl", project.getDeployedHealthUrl());
             }
             out.put("run", firstRun);
             return out;
@@ -1399,17 +1415,23 @@ public class MicroserviceBridgeService {
         }
     }
 
+    /** Everything the "deployment-url" artifact carries — read straight
+     *  off it instead of re-deriving mcpUrl/healthUrl on the frontend, so
+     *  they're always exactly what the workflow actually computed. */
+    private record DeployedUrls(String url, String mcpUrl, String healthUrl) {}
+
     /**
      * Downloads the workflow's "deployment-url" artifact (a small zip
      * containing {@code .deploy-url.json}, written by mcp.yml's "Save
      * Deployed URL as Artifact File" step) and extracts the Cloud Run
-     * service URL. Three GitHub API calls: list artifacts for the run →
-     * find the one named "deployment-url" → download + unzip it.
-     * Best-effort — returns null on any failure (artifact not ready yet,
-     * expired, workflow predates this artifact step, parse error) so a
-     * hiccup here never breaks status polling.
+     * service URL + its /mcp and health-check siblings. Three GitHub API
+     * calls: list artifacts for the run → find the one named
+     * "deployment-url" → download + unzip it. Best-effort — returns null
+     * on any failure (artifact not ready yet, expired, workflow predates
+     * this artifact step, parse error) so a hiccup here never breaks
+     * status polling.
      */
-    private String fetchDeployedUrlFromArtifact(String orgOrUser, String repo, String runId, String token) {
+    private DeployedUrls fetchDeployedUrlFromArtifact(String orgOrUser, String repo, String runId, String token) {
         if (runId == null || runId.isBlank()) return null;
         try {
             java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
@@ -1448,7 +1470,10 @@ public class MicroserviceBridgeService {
                         com.fasterxml.jackson.databind.JsonNode urlJson =
                                 new com.fasterxml.jackson.databind.ObjectMapper().readTree(content);
                         String svcUrl = urlJson.path("url").asText(null);
-                        if (svcUrl != null && !svcUrl.isBlank()) return svcUrl;
+                        if (svcUrl == null || svcUrl.isBlank()) continue;
+                        String mcpUrl = urlJson.path("mcpUrl").asText(null);
+                        String healthUrl = urlJson.path("healthUrl").asText(null);
+                        return new DeployedUrls(svcUrl, mcpUrl, healthUrl);
                     }
                 }
             }

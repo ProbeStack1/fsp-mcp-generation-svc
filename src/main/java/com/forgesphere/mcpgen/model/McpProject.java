@@ -162,6 +162,13 @@ public class McpProject {
      *  artifact. Surfaced on the Test Studio "auto-register" flow and on the
      *  Dashboard MCP card so users land on the live URL with one click. */
     private String  deployedServiceUrl;
+    /** {@code deployedServiceUrl + "/mcp"} — read straight off the same
+     *  artifact (the workflow already computes it) rather than having the
+     *  frontend re-derive it, so it's always exactly right even if the
+     *  transport path convention ever changes. */
+    private String  deployedMcpUrl;
+    /** {@code deployedServiceUrl + <healthCheck.path>} — same idea. */
+    private String  deployedHealthUrl;
     private Instant deployedAt;
 
     // ---------------- lifecycle flags ----------------

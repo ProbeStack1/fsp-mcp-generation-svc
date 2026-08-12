@@ -156,28 +156,59 @@ public class TestCollectionGenerator {
         return meta;
     }
 
+    /**
+     * Generates a plausible value for one JSON-Schema property. Recurses
+     * into nested "object" properties and "array of object" items instead
+     * of the old flat {@code {"key": "value"}} placeholder — tools like
+     * MCP's createNote/updateNote/shareNote wrap their real payload in a
+     * nested "body" object (per the OpenAPI-to-MCP parser's requestBody
+     * convention), so a flat placeholder there produced a positive-path
+     * test whose "positive" request would actually fail validation in the
+     * generated handler (body.title/body.content missing). Prefers the
+     * schema's own "enum"/"default" when present so samples read like
+     * real data instead of generic filler.
+     */
     @SuppressWarnings("unchecked")
-    private Map<String, Object> generateValidArgs(Tool tool) {
-        Map<String, Object> schema = tool.getInputSchema();
+    private Object generateValueForProp(Map<String, Object> prop, String key) {
+        if (prop == null) return "sample-" + key;
+        if (prop.containsKey("default")) return prop.get("default");
+        if (prop.get("enum") instanceof List<?> enumVals && !enumVals.isEmpty()) return enumVals.get(0);
+        String type = (String) prop.getOrDefault("type", "string");
+        return switch (type) {
+            case "number" -> 42;
+            case "integer" -> 42;
+            case "boolean" -> true;
+            case "array" -> {
+                Object items = prop.get("items");
+                if (items instanceof Map) {
+                    Map<String, Object> itemSchema = (Map<String, Object>) items;
+                    String itemType = (String) itemSchema.getOrDefault("type", "string");
+                    yield "object".equals(itemType)
+                            ? List.of(generateValidArgsFromSchema(itemSchema))
+                            : List.of(generateValueForProp(itemSchema, key));
+                }
+                yield List.of("sample");
+            }
+            case "object" -> generateValidArgsFromSchema(prop);
+            default -> "sample-" + key;
+        };
+    }
+
+    @SuppressWarnings("unchecked")
+    private Map<String, Object> generateValidArgsFromSchema(Map<String, Object> schema) {
         if (schema == null) return Map.of();
         Object props = schema.get("properties");
         if (!(props instanceof Map)) return Map.of();
         Map<String, Object> propMap = (Map<String, Object>) props;
         Map<String, Object> args = new LinkedHashMap<>();
         for (String key : propMap.keySet()) {
-            Map<String, Object> prop = (Map<String, Object>) propMap.get(key);
-            String type = (String) prop.getOrDefault("type", "string");
-            Object value = switch (type) {
-                case "number" -> 42;
-                case "integer" -> 42;
-                case "boolean" -> true;
-                case "array" -> List.of("sample");
-                case "object" -> Map.of("key", "value");
-                default -> "sample-" + key;
-            };
-            args.put(key, value);
+            args.put(key, generateValueForProp((Map<String, Object>) propMap.get(key), key));
         }
         return args;
+    }
+
+    private Map<String, Object> generateValidArgs(Tool tool) {
+        return generateValidArgsFromSchema(tool.getInputSchema());
     }
 
     @SuppressWarnings("unchecked")

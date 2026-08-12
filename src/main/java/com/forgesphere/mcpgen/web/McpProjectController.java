@@ -317,9 +317,21 @@ public class McpProjectController {
         // to only get built as a side-effect of downloading the full
         // bundle at Step 11, which nothing before it ever triggered.
         // Best-effort: never let a test-collection hiccup fail /generate.
+        //
+        // IMPORTANT: `McpProject.generated` is `@Transient` — the file
+        // list is deliberately NEVER written to Mongo (see the field's
+        // own javadoc), only kept in-memory on this exact `p` reference.
+        // A previous version of this fix re-fetched the project via
+        // `svc.get(id)` after uploadTestCollection() to "pick up" the
+        // saved testCollectionUrl — but that re-fetch came back from
+        // Mongo with `generated == null`, so every /generate response
+        // silently reported fileCount: 0 / files: []. Stay on the
+        // in-memory `p` and merge the URL into it directly instead.
         try {
-            bundleBuilder.uploadTestCollection(p);
-            p = svc.get(id).orElse(p);
+            String testCollectionUrl = bundleBuilder.uploadTestCollection(p);
+            if (testCollectionUrl != null && !testCollectionUrl.isBlank() && p.getGenerated() != null) {
+                p.getGenerated().setTestCollectionUrl(testCollectionUrl);
+            }
         } catch (Exception ignored) { /* toGenerateResponse just omits the URL */ }
         return Envelope.ok(toGenerateResponse(p));
     }
