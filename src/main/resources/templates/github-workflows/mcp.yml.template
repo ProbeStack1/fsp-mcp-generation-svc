@@ -3,13 +3,18 @@
 #   2. Build — Docker image, push to Artifact Registry.
 #   3. Deploy — Cloud Run (us-central1), --allow-unauthenticated.
 #   4. URL  — print to job log, GitHub Step Summary, downloadable artifact.
+#
+# Trigger branch is ${devBranch} — the SAME branch the ForgeSphere wizard's
+# "Push to GitHub" pushes to (the connector's saved CICD dev branch), not a
+# hardcoded "main". Other CICD-strategy branches (staging/main/etc.) may get
+# created alongside it, but only THIS branch drives push -> deploy.
 
 name: CI/CD - ${slug} Deploy to Cloud Run
 
 on:
   push:
     branches:
-      - main
+      - ${devBranch}
     # Skip the deploy pipeline when the only changes are docs / markdown
     # / git metadata — these never affect the deployed image and were
     # firing wasteful runs on single-file edits (e.g. README touch-ups).
@@ -25,7 +30,7 @@ on:
       - '.idea/**'
   pull_request:
     branches:
-      - main
+      - ${devBranch}
     types: [opened, synchronize, reopened]
     paths-ignore:
       - '**/*.md'
@@ -73,7 +78,7 @@ ${langSteps}
     name: deploy-to-cloud-run
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    if: github.event_name == 'push' && github.ref == 'refs/heads/${devBranch}'
 
     permissions:
       contents: read

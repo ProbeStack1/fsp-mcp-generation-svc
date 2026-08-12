@@ -442,6 +442,17 @@ public class McpGenerationService {
                 .filter(g -> g.language().equalsIgnoreCase(lang))
                 .findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("unsupported language: " + lang));
+        // Resolve the connector's dev branch BEFORE generating so the
+        // embedded .github/workflows/mcp.yml's push-trigger is baked in
+        // to match the branch `push()` will actually push to — deploy
+        // then fires off the SAME branch the code lands on, instead of
+        // the old hardcoded "main" that silently went stale after the
+        // first push. Best-effort: falls back to "main" on any failure.
+        try {
+            p.setDevBranch(bridgeService.resolveDevBranch(p));
+        } catch (Exception e) {
+            p.setDevBranch("main");
+        }
         var files = new ArrayList<>(gen.generate(p));
         // Honour the user's Step 7 picks — strip test kinds they
         // unchecked, add postman/inspector/Dockerfile/client configs

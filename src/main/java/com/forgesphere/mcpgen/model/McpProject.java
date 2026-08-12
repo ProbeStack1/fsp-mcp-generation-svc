@@ -133,6 +133,17 @@ public class McpProject {
     private String  gcsArchivePath;                 // gs object key under shared bucket
     private Instant mirroredAt;                     // last successful mirror write
 
+    /**
+     * The connector's configured source branch (e.g. the CICD profile's
+     * "dev" branch), resolved fresh at every {@code generate()} call so
+     * the embedded GitHub Actions workflow's push-trigger always targets
+     * the SAME branch the wizard actually pushes code to. Not persisted —
+     * always recomputed from the connector so it can never go stale if
+     * the connector is changed after a project already has a doc.
+     */
+    @Transient
+    private String  devBranch;
+
     private String  pushedRepoFullName;             // e.g. "ForgeCrux/offer-subscription-sf"
     private String  pushedRepoUrl;
     private String  pushedBranch;

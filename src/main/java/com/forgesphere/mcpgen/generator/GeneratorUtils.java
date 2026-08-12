@@ -213,6 +213,11 @@ public final class GeneratorUtils {
      *   ${language}    → typescript | python | java | raw
      *   ${langSteps}   → per-language GitHub Actions setup + test steps
      *   ${connectorId} → the onboarding connector id (empty when unset)
+     *   ${devBranch}   → connector's saved source branch (falls back to
+     *                    "main" until a connector is saved) — the
+     *                    push-trigger and deploy-job's branch gate both
+     *                    target this so deploy fires off the same branch
+     *                    the wizard's push() actually pushes to.
      */
     public static String buildGithubWorkflow(McpProject p) {
         String slug = p.getIdentity() != null && p.getIdentity().getSlug() != null && !p.getIdentity().getSlug().isBlank()
@@ -220,6 +225,12 @@ public final class GeneratorUtils {
         String lang = p.getRuntime() != null && p.getRuntime().getLanguage() != null
                 ? p.getRuntime().getLanguage() : "typescript";
         String connectorId = p.getConnectorId() != null ? p.getConnectorId() : "";
+        // The branch the wizard's push() actually pushes to (connector's
+        // saved CICD "dev" branch) — baked into the workflow's trigger so
+        // deploy fires off the SAME branch the code lands on. Falls back
+        // to "main" when unresolved (no connector saved yet).
+        String devBranch = p.getDevBranch() != null && !p.getDevBranch().isBlank()
+                ? p.getDevBranch() : "main";
 
         // Port + health path used by the deploy-to-Cloud-Run step.
         // Defaults match what TypeScriptGenerator/PythonGenerator emit
@@ -250,7 +261,8 @@ public final class GeneratorUtils {
                 .replace("${langEnvVars}", buildLanguageEnvVars(lang))
                 .replace("${connectorId}", connectorId)
                 .replace("${port}",        port)
-                .replace("${healthPath}",  healthPath);
+                .replace("${healthPath}",  healthPath)
+                .replace("${devBranch}",   devBranch);
     }
 
     /**

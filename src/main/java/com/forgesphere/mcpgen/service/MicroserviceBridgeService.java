@@ -91,6 +91,12 @@ public class MicroserviceBridgeService {
     private final BridgeGcsClient gcs;
     private final BridgeProperties props;
 
+    // Same CICD profile service the microservice/proxy/kong pipeline reads
+    // branch strategy from (fsp-api-development-svc's DeployService).
+    @org.springframework.beans.factory.annotation.Value(
+            "${cicd.service.url:https://forgesphere.probestack.io/cicd-automation/v1/api/cicd-config}")
+    private String cicdServiceBaseUrl;
+
     /**
      * Returns the {@link MongoCollection} the bridge should write to,
      * honouring {@code forgesphere.bridge.coll.database} when set.
@@ -418,6 +424,27 @@ public class MicroserviceBridgeService {
                     failedFiles.add(err);
                 }
             }
+        }
+
+        // ─── Create the rest of the branch strategy (staging/main/etc.) ─
+        // Same idea as the microservice/proxy/kong pipeline's
+        // `branches_to_create` — read the org's default CICD strategy and
+        // fan the pushed commit out to every non-dev branch so this repo
+        // ends up with the same multi-branch layout, instead of the code
+        // only ever living on the one branch the connector points at.
+        // Best-effort: a CICD-profile hiccup should never fail the push
+        // itself, since the primary branch already has the code.
+        try {
+            List<String> branchesToCreate = fetchBranchesToCreate(mcp.getOnboardingId());
+            for (String extraBranch : branchesToCreate) {
+                if (extraBranch == null || extraBranch.isBlank() || extraBranch.equalsIgnoreCase(branch)) continue;
+                ensureBranchExists(http, orgOrUser, repo, extraBranch, branch, token);
+            }
+            if (!branchesToCreate.isEmpty()) {
+                log.info("[push] created/verified branch strategy for {}/{}: {}", orgOrUser, repo, branchesToCreate);
+            }
+        } catch (Exception e) {
+            log.warn("[push] couldn't apply CICD branch strategy for project {}: {}", mcp.getId(), e.getMessage());
         }
 
         // ─── Persist push state on our McpProject doc ────────────────
@@ -780,6 +807,57 @@ public class MicroserviceBridgeService {
      * Ensure the user-requested `branch` exists in the repo. If it
      * doesn't, fork it from `sourceBranch` (usually the repo default).
      */
+    /**
+     * Reads the org's default CICD branch strategy (same endpoint/shape
+     * {@code fsp-api-development-svc}'s DeployService.buildBranchesToCreate
+     * reads for microservice/proxy/kong) and returns every branch name
+     * except the "dev" one — that one is the push target itself, passed
+     * separately as {@code branch} at the call site.
+     *
+     * @param onboardingId the McpProject's linked onboarding id; if null/
+     *                      blank or the CICD call fails, returns an empty
+     *                      list so the caller's best-effort wrapper just
+     *                      skips branch creation rather than failing.
+     */
+    private List<String> fetchBranchesToCreate(String onboardingId) {
+        if (onboardingId == null || onboardingId.isBlank()) return List.of();
+        try {
+            java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+            var req = java.net.http.HttpRequest.newBuilder(
+                    java.net.URI.create(cicdServiceBaseUrl + "/" + onboardingId + "/all?filtered=true"))
+                    .header("Accept", "application/json")
+                    .GET().build();
+            var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() != 200) {
+                log.warn("[push] CICD config lookup for onboarding {} returned {}", onboardingId, resp.statusCode());
+                return List.of();
+            }
+            com.fasterxml.jackson.databind.JsonNode root = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .readTree(resp.body());
+            com.fasterxml.jackson.databind.JsonNode strategies = root.path("data").has("strategies")
+                    ? root.path("data").path("strategies") : root.path("strategies");
+            if (!strategies.isArray() || strategies.isEmpty()) return List.of();
+
+            com.fasterxml.jackson.databind.JsonNode defaultStrategy = null;
+            for (var s : strategies) {
+                if (s.path("isDefault").asBoolean(false)) { defaultStrategy = s; break; }
+            }
+            if (defaultStrategy == null) defaultStrategy = strategies.get(0);
+
+            List<String> result = new ArrayList<>();
+            for (var b : defaultStrategy.path("branches")) {
+                String tag = b.path("tag").asText(null);
+                String name = b.path("name").asText(null);
+                if ("dev".equals(tag) || name == null || name.isBlank()) continue;
+                result.add(name);
+            }
+            return result;
+        } catch (Exception e) {
+            log.warn("[push] failed to fetch CICD branch strategy for onboarding {}: {}", onboardingId, e.getMessage());
+            return List.of();
+        }
+    }
+
     private void ensureBranchExists(java.net.http.HttpClient http, String orgOrUser, String repo,
                                     String branch, String sourceBranch, String token) {
         if (branch == null || branch.isBlank()) return;
@@ -1009,6 +1087,37 @@ public class MicroserviceBridgeService {
         } catch (Exception e) {
             log.warn("[bridge] connector by-org lookup failed for {}: {}", org, e.getMessage());
             return null;
+        }
+    }
+
+    /**
+     * Resolves the connector's saved source branch (the one the wizard
+     * actually pushes to — the CICD profile's "dev" branch, saved on the
+     * connector via the ConnectorModal). Called at {@code generate()} time
+     * so the embedded {@code .github/workflows/mcp.yml}'s push-trigger is
+     * baked in to match, instead of being hardcoded to "main" while the
+     * code actually lands on a different branch.
+     *
+     * Falls back to "main" whenever a connector isn't resolvable yet
+     * (brand-new project, no connector saved) so generation never breaks —
+     * the workflow just targets "main" until a real connector is saved,
+     * same as the previous hardcoded behaviour.
+     */
+    public String resolveDevBranch(McpProject p) {
+        try {
+            String connectorId = resolveConnectorId(p);
+            if (connectorId == null) return "main";
+            org.bson.Document conn = bridgeColl(props.getColl().getConnector())
+                    .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
+                    .first();
+            if (conn == null) return "main";
+            org.bson.Document scm = conn.get("sourceCodeManagement", org.bson.Document.class);
+            if (scm == null) return "main";
+            String branch = scm.getString("branch");
+            return (branch == null || branch.isBlank()) ? "main" : branch.trim();
+        } catch (Exception e) {
+            log.warn("[bridge] resolveDevBranch failed for project {}: {}", p.getId(), e.getMessage());
+            return "main";
         }
     }
 
