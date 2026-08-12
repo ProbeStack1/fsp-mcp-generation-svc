@@ -238,6 +238,17 @@ public class McpProject {
         @Builder.Default private List<String> consumerIds = List.of();
 
         /**
+         * Step 2 (Requirements). Missing from this model entirely was the
+         * bug behind "requirement nahi dikhta" — the frontend always sent
+         * these two fields, but Jackson silently drops unknown JSON
+         * properties when binding to a POJO with no matching field, so
+         * they were never actually persisted despite the user typing
+         * real text and the save call returning 200.
+         */
+        private String functionalRequirements;
+        private String nonFunctionalRequirements;
+
+        /**
          * Free-form bag where the wizard's Step 7 substeps stash the
          * user's generation choices (test kinds, helper artefacts,
          * client configs to ship). Stored as a {@code Map} on purpose
