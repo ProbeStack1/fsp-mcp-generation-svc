@@ -1547,7 +1547,21 @@ public class MicroserviceBridgeService {
     // Internal connector-credential record returned by resolveGitHubCreds.
     private record GhCreds(String token, String orgOrUser, String repo) {}
 
-    /** Reads {token, orgOrUser, repo} off the project's connector. */
+    /**
+     * Reads {token, orgOrUser, repo} off the project's connector.
+     *
+     * `repo` is NOT read from the connector's own {@code sourceCodeManagement.repo}
+     * field — mirrors pushToGitHub() above: a connector is often shared across
+     * multiple MCP projects and rarely has an explicit repo pinned on it (repo
+     * name is derived per-project instead, collision-checked, and persisted as
+     * {@code project.pushedRepoFullName} once the first push succeeds). Requiring
+     * {@code scm.repo} here meant this always returned null — "No GitHub
+     * connector configured" — for any project that pushed successfully through
+     * the normal (derived-name) path, since the connector's `repo` field was
+     * never populated to begin with. Prefer the project's own pushed repo,
+     * falling back to the connector's explicit repo for the rare case it's set
+     * before a first push has happened.
+     */
     private GhCreds resolveGitHubCreds(McpProject project) {
         String connectorId = resolveConnectorId(project);
         if (connectorId == null) return null;
@@ -1559,8 +1573,15 @@ public class MicroserviceBridgeService {
         if (scm == null) return null;
         String token = scm.getString("token");
         String orgOrUser = scm.getString("orgOrUser");
-        String repo = scm.getString("repo");
-        if (token == null || orgOrUser == null || repo == null) return null;
+        String repo = null;
+        if (project.getPushedRepoFullName() != null && !project.getPushedRepoFullName().isBlank()) {
+            String[] parts = project.getPushedRepoFullName().split("/", 2);
+            repo = parts.length == 2 ? parts[1] : project.getPushedRepoFullName();
+        }
+        if (repo == null || repo.isBlank()) {
+            repo = scm.getString("repo");
+        }
+        if (token == null || orgOrUser == null || repo == null || repo.isBlank()) return null;
         return new GhCreds(token, orgOrUser, repo);
     }
 
