@@ -68,9 +68,12 @@ import java.util.UUID;
 @RequiredArgsConstructor
 public class MicroserviceBridgeService {
 
-    /** Marker stamped on every mirrored doc so audits can spot
-     *  artefacts that came from the MCP wizard at a glance. */
-    private static final String PROJECT_TYPE_MCP = "MCP_SERVER";
+    /** Stamped as {@code projectType} on every mirrored doc. This is BOTH
+     *  the "came from the MCP wizard" audit marker AND the CICD-profile
+     *  asset-type key fsp-api-development-svc's DeployService looks up
+     *  ({@code pipelineConfigs["MCP"]}). Was "MCP_SERVER"; DeployService /
+     *  MergeService fold that legacy value onto "MCP". */
+    private static final String PROJECT_TYPE_MCP = "MCP";
 
     /** {@code _class} discriminators — must match  mapper. */
     private static final String CLASS_CODEGEN_RESULT =
@@ -82,6 +85,11 @@ public class MicroserviceBridgeService {
 
     /** Signed URL expiry —  uses 60 minutes. */
     private static final long SIGNED_URL_TTL_MINUTES = 60;
+
+    /** Longer expiry for the URL handed to the onboarding pipeline: a
+     *  workflow_dispatch can sit queued / be retried well beyond an hour,
+     *  and this URL is the pipeline's ONLY way to fetch the bundle. */
+    private static final long PIPELINE_SIGNED_URL_TTL_MINUTES = 720; // 12h
 
     private static final DateTimeFormatter DATE_FOLDER = DateTimeFormatter.ofPattern("yyyy-MM-dd");
 
@@ -96,6 +104,25 @@ public class MicroserviceBridgeService {
     @org.springframework.beans.factory.annotation.Value(
             "${cicd.service.url:https://forgesphere.probestack.io/cicd-automation/v1/api/cicd-config}")
     private String cicdServiceBaseUrl;
+
+    // fsp-api-development-svc base URL — the pipeline deploy path POSTs to
+    // {this}/v1/api-development/{microserviceId}/deploy-to-github after a mirror.
+    @org.springframework.beans.factory.annotation.Value(
+            "${api-development.service.url:https://forgesphere.probestack.io/api-development}")
+    private String apiDevelopmentServiceUrl;
+
+    // Public base URL of THIS service, used to build the bundle-download URL
+    // (`{base}/mcp-generate/v1/api/projects/{id}/artifact.zip`) handed to the
+    // onboarding pipeline. Falls back to the shared ingress host.
+    @org.springframework.beans.factory.annotation.Value(
+            "${mcpgen.public-base-url:https://forgesphere.probestack.io}")
+    private String mcpgenPublicBaseUrl;
+
+    // Feature flag: true  → `/push-to-github` runs the pipeline path
+    //               false → legacy direct Git Data API push (fallback)
+    @org.springframework.beans.factory.annotation.Value(
+            "${mcpgen.deploy.pipeline-enabled:true}")
+    private boolean pipelineDeployEnabled;
 
     /**
      * Returns the {@link MongoCollection} the bridge should write to,
@@ -184,6 +211,9 @@ public class MicroserviceBridgeService {
         doc.put("consumerIds", ob == null || ob.getConsumerIds() == null
                 ? List.of() : ob.getConsumerIds());
         doc.put("connectorId", resolveConnectorId(project));
+        // DeployService.buildDeployContext reads microservice.repositoryName
+        // first when resolving the repo the pipeline should create/reuse.
+        doc.put("repositoryName", project.getRepositoryName());
         doc.put("mcpProjectId", project.getId());
         doc.put("mcpSlug", id == null ? null : id.getSlug());
         doc.put("createdAt", now);
@@ -201,6 +231,14 @@ public class MicroserviceBridgeService {
      * can chain the existing {@code uploadToGitHub(microserviceId)} call.
      */
     public Map<String, Object> mirror(McpProject project) {
+        // 0) The pipeline resolves SCM (token/org) + branch strategy from the
+        //    CICD profile keyed by onboardingId — it is mandatory now.
+        if (project.getOnboardingId() == null || project.getOnboardingId().isBlank()) {
+            throw new IllegalStateException(
+                "This MCP project has no onboardingId. Complete onboarding before deploying "
+              + "so the CICD pipeline profile can be resolved.");
+        }
+
         // 1) Generate on demand — push pipelines expect a non-empty artefact.
         McpProject p = project;
         if (p.getGenerated() == null
@@ -226,8 +264,16 @@ public class MicroserviceBridgeService {
         String slug = mcp.getIdentity() != null && mcp.getIdentity().getSlug() != null
                 ? mcp.getIdentity().getSlug() : "mcp-server";
 
-        log.info("[bridge] mirroring project={} → microserviceId={} artifactId={} codeGenResultId={} files={}",
-                mcp.getId(), microserviceId, artifactId, codeGenResultId, fileCount);
+        // 2b) Repo name the pipeline will create/reuse. Persist on the project
+        //     so a re-deploy always lands in the SAME repo. Matches the
+        //     microservice flow, which reads microservice.repositoryName in
+        //     DeployService.buildDeployContext (no collision check there —
+        //     onboarding.yml clones-or-reuses an existing repo of that name).
+        String repositoryName = firstNonBlank(mcp.getRepositoryName(), deriveRepoNameFromProject(mcp));
+        mcp.setRepositoryName(repositoryName);
+
+        log.info("[bridge] mirroring project={} → microserviceId={} artifactId={} codeGenResultId={} repo={} files={}",
+                mcp.getId(), microserviceId, artifactId, codeGenResultId, repositoryName, fileCount);
 
         // 3) Build zip + upload to GCS ( exact path pattern).
         byte[] zipBytes = buildZipBytes(mcp);
@@ -236,17 +282,31 @@ public class MicroserviceBridgeService {
         String objectKey = microserviceId + "/" + dateFolder + "/" + fileUuid + "_" + archiveFileName;
         String gcsObjectPath = gcs.upload(objectKey, zipBytes);
         String gcsArchivePath = "gs://" + gcs.getBucket() + "/" + gcsObjectPath;
-        String archiveDownloadUrl = gcs.signedUrl(gcsObjectPath, SIGNED_URL_TTL_MINUTES);
         log.info("[bridge] uploaded zip to {} bytes={}", gcsArchivePath, zipBytes.length);
 
+        // 3b) Resolve the URL the onboarding pipeline will `curl -L` to fetch
+        //     the bundle. PRIMARY: this service's stable /artifact.zip route
+        //     (re-signs fresh on every hit → survives a long queue delay).
+        //     FALLBACK: a direct 12h V4 signed URL, chosen automatically when
+        //     a preflight shows the route is gated / unreachable. DeployService
+        //     forwards this verbatim as ZIP_URL because we DON'T set
+        //     gcsArchivePath on the mirror doc (so it won't try to re-sign it
+        //     with its own service account — the source of the old 404s).
+        ArtifactUrl artifact = resolvePipelineArtifactUrl(mcp.getId(), gcsObjectPath);
+        mcp.setArtifactUrlMode(artifact.mode());
+        log.info("[bridge] pipeline bundle URL mode={} url={}", artifact.mode(), artifact.url());
+
         // 4) Write the three mirror docs (codegen_results FIRST so the
-        //    microservice doc can reference it).
+        //    microservice doc can reference it). gcsArchivePath is passed as
+        //    null ON PURPOSE — see 3b.
         upsertCodegenResults(mcp, microserviceId, codeGenResultId, generationId, slug,
-                gcsArchivePath, archiveDownloadUrl, archiveFileName, zipBytes.length, fileUuid);
+                null, artifact.url(), archiveFileName, zipBytes.length, fileUuid);
         upsertMicroserviceDoc(mcp, microserviceId, codeGenResultId);
         upsertDeploymentArtifact(mcp, microserviceId, artifactId);
 
-        // 5) Persist mirror state on our doc for idempotency.
+        // 5) Persist mirror state on our doc for idempotency. We keep the real
+        //    gcsArchivePath HERE (our own field) even though the mirror doc
+        //    omits it — /artifact.zip re-signs from this.
         mcp.setMicroserviceMirrorId(microserviceId);
         mcp.setDeploymentArtifactId(artifactId);
         mcp.setCodeGenResultId(codeGenResultId);
@@ -259,14 +319,205 @@ public class MicroserviceBridgeService {
         out.put("deploymentArtifactId", artifactId);
         out.put("codeGenResultId",      codeGenResultId);
         out.put("generationId",         generationId);
+        out.put("repositoryName",       repositoryName);
         out.put("gcsBucket",            gcs.getBucket());
         out.put("gcsArchivePath",       gcsArchivePath);
-        out.put("archiveDownloadUrl",   archiveDownloadUrl);
+        out.put("archiveDownloadUrl",   artifact.url());
+        out.put("artifactUrlMode",      artifact.mode());
         out.put("archiveFileName",      archiveFileName);
         out.put("archiveSizeBytes",     zipBytes.length);
         out.put("fileCount",            fileCount);
         log.info("[bridge] mirror complete project={} microserviceId={}", mcp.getId(), microserviceId);
         return out;
+    }
+
+    /** {url, mode} pair — mode is "ENDPOINT" or "SIGNED". */
+    private record ArtifactUrl(String url, String mode) {}
+
+    /**
+     * Decides which URL the onboarding pipeline should fetch the bundle from.
+     *
+     *  PRIMARY  — {@code {publicBase}/mcp-generate/v1/api/projects/{id}/artifact.zip}
+     *             (stable; 302-redirects to a freshly-signed GCS URL on every
+     *             hit, so a workflow that sits queued for hours still works).
+     *  FALLBACK — a direct {@value #PIPELINE_SIGNED_URL_TTL_MINUTES}-minute V4
+     *             signed URL, used when a preflight shows the route is gated by
+     *             the ingress (401/403/redirect-to-login) or unreachable.
+     *
+     *  Both forms work with {@code curl -L}. Best-effort: any preflight error
+     *  is treated as "route not usable" and we fall back to the signed URL.
+     */
+    private ArtifactUrl resolvePipelineArtifactUrl(String projectId, String gcsObjectPath) {
+        String signed = gcs.signedUrl(gcsObjectPath, PIPELINE_SIGNED_URL_TTL_MINUTES);
+        if (projectId == null || projectId.isBlank()) {
+            return new ArtifactUrl(signed, "SIGNED");
+        }
+        String endpoint = mcpgenPublicBaseUrl.replaceAll("/+$", "")
+                + "/mcp-generate/v1/api/projects/" + projectId + "/artifact.zip";
+        try {
+            java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder()
+                    .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
+                    .connectTimeout(java.time.Duration.ofSeconds(5))
+                    .build();
+            var req = java.net.http.HttpRequest.newBuilder(java.net.URI.create(endpoint))
+                    .timeout(java.time.Duration.ofSeconds(5))
+                    .header("Range", "bytes=0-0")
+                    .GET().build();
+            var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+            int sc = resp.statusCode();
+            if (sc == 302 || sc == 301 || sc == 307 || sc == 308) {
+                String loc = resp.headers().firstValue("location").orElse("");
+                if (loc.contains("storage.googleapis.com")) {
+                    return new ArtifactUrl(endpoint, "ENDPOINT");
+                }
+                log.warn("[bridge] /artifact.zip preflight redirected to non-GCS location '{}' — using signed URL", loc);
+                return new ArtifactUrl(signed, "SIGNED");
+            }
+            if (sc == 200 || sc == 206) {
+                String ct = resp.headers().firstValue("content-type").orElse("").toLowerCase();
+                if (ct.startsWith("application/zip") || ct.startsWith("application/octet-stream")) {
+                    return new ArtifactUrl(endpoint, "ENDPOINT");
+                }
+                log.warn("[bridge] /artifact.zip preflight 200 with content-type '{}' — using signed URL", ct);
+                return new ArtifactUrl(signed, "SIGNED");
+            }
+            log.warn("[bridge] /artifact.zip preflight status {} — using signed URL", sc);
+            return new ArtifactUrl(signed, "SIGNED");
+        } catch (Exception e) {
+            log.warn("[bridge] /artifact.zip preflight failed ({}) — using signed URL", e.getMessage());
+            return new ArtifactUrl(signed, "SIGNED");
+        }
+    }
+
+    /**
+     * Fresh {@value #PIPELINE_SIGNED_URL_TTL_MINUTES}-minute signed URL for a
+     * project's most recently mirrored bundle. Backs the {@code /artifact.zip}
+     * route so every pipeline fetch — even a retry hours later — gets a live
+     * link. Returns null when the project was never mirrored.
+     */
+    public String freshSignedBundleUrl(McpProject p) {
+        String gs = p == null ? null : p.getGcsArchivePath();
+        if (gs == null || gs.isBlank()) return null;
+        String prefix = "gs://" + gcs.getBucket() + "/";
+        String objectPath = gs.startsWith(prefix) ? gs.substring(prefix.length())
+                : gs.replaceFirst("^gs://[^/]+/", "");
+        return gcs.signedUrl(objectPath, PIPELINE_SIGNED_URL_TTL_MINUTES);
+    }
+
+    private static String firstNonBlank(String... vals) {
+        if (vals != null) {
+            for (String v : vals) if (v != null && !v.isBlank()) return v.trim();
+        }
+        return null;
+    }
+
+    public boolean isPipelineDeployEnabled() {
+        return pipelineDeployEnabled;
+    }
+
+    /**
+     * Pipeline deploy path (the default for {@code POST /projects/{id}/push-to-github}).
+     *
+     *   1. {@link #mirror(McpProject)} — writes the codegen_results /
+     *      microservice / deployment_artifacts docs the same shape
+     *      fsp-api-development-svc's own generate step writes, uploads the
+     *      bundle to the shared bucket, and resolves the ZIP_URL.
+     *   2. POST {@code {apiDevelopmentServiceUrl}/v1/api-development/{microserviceId}/deploy-to-github}
+     *      — DeployService resolves SCM (token/org) + branch strategy from the
+     *      CICD "MCP" pipeline profile and dispatches ForgeCrux/ps-onboarding's
+     *      onboarding.yml, which creates the repo and pushes the bundle. The
+     *      repo's own .github/workflows/mcp.yml then deploys to Cloud Run.
+     *
+     * The repo/branch the pipeline targets are recorded on the McpProject
+     * here (at dispatch time) so the status poller / DeployStatusReaper can
+     * find the workflow run — the direct-push path used to set these only
+     * after a successful push.
+     */
+    public Map<String, Object> deployViaPipeline(McpProject project, String actorEmail) {
+        Map<String, Object> mirrorOut = mirror(project);
+        String microserviceId = String.valueOf(mirrorOut.get("microserviceId"));
+
+        String url = apiDevelopmentServiceUrl.replaceAll("/+$", "")
+                + "/v1/api-development/" + microserviceId + "/deploy-to-github";
+
+        Map<String, Object> data;
+        try {
+            java.net.http.HttpClient http = java.net.http.HttpClient.newBuilder()
+                    .connectTimeout(java.time.Duration.ofSeconds(10))
+                    .build();
+            var reqB = java.net.http.HttpRequest.newBuilder(java.net.URI.create(url))
+                    .timeout(java.time.Duration.ofSeconds(60))
+                    .header("Content-Type", "application/json")
+                    .POST(java.net.http.HttpRequest.BodyPublishers.ofString("{}"));
+            if (actorEmail != null && !actorEmail.isBlank()) {
+                reqB.header("x-user-email", actorEmail).header("userEmail", actorEmail);
+            }
+            var resp = http.send(reqB.build(), java.net.http.HttpResponse.BodyHandlers.ofString());
+            if (resp.statusCode() / 100 != 2) {
+                // Surface api-development's own error message verbatim (same
+                // text a microservice deploy would show — e.g. "Pipeline
+                // config not found for asset type: MCP") instead of wrapping
+                // it in transport noise.
+                String msg = null;
+                try {
+                    msg = new com.fasterxml.jackson.databind.ObjectMapper()
+                            .readTree(resp.body()).path("message").asText(null);
+                } catch (Exception ignore) { /* not JSON */ }
+                throw new IllegalStateException(
+                        (msg != null && !msg.isBlank())
+                                ? msg
+                                : "Deploy request failed (HTTP " + resp.statusCode() + ").");
+            }
+            com.fasterxml.jackson.databind.JsonNode root =
+                    new com.fasterxml.jackson.databind.ObjectMapper().readTree(resp.body());
+            com.fasterxml.jackson.databind.JsonNode d = root.path("data");
+            if (d.isMissingNode() || d.isNull()) {
+                throw new IllegalStateException("api-development deploy-to-github: no data in response: "
+                        + truncate(resp.body(), 600));
+            }
+            data = new com.fasterxml.jackson.databind.ObjectMapper()
+                    .convertValue(d, new com.fasterxml.jackson.core.type.TypeReference<Map<String, Object>>() {});
+        } catch (RuntimeException e) {
+            throw e;
+        } catch (Exception e) {
+            throw new IllegalStateException("Failed to call api-development deploy-to-github: " + e.getMessage(), e);
+        }
+
+        String orgName  = String.valueOf(data.getOrDefault("orgName", ""));
+        String repoName = String.valueOf(data.getOrDefault("repoName", project.getRepositoryName()));
+        String branch   = data.get("branch") == null ? null : String.valueOf(data.get("branch"));
+        String deploymentId = data.get("deploymentId") == null ? null : String.valueOf(data.get("deploymentId"));
+
+        McpProject fresh = project.getId() == null ? project
+                : projects.findById(project.getId()).orElse(project);
+        if (!orgName.isBlank() && !repoName.isBlank()) {
+            fresh.setPipelineRepoFullName(orgName + "/" + repoName);
+            fresh.setPipelineRepoUrl("https://github.com/" + orgName + "/" + repoName);
+        }
+        fresh.setPipelineBranch(branch);
+        fresh.setDeploymentId(deploymentId);
+        fresh.setDeployTriggeredAt(Instant.now());
+        if (fresh.getRepositoryName() == null || fresh.getRepositoryName().isBlank()) {
+            fresh.setRepositoryName(repoName);
+        }
+        if (fresh.getId() != null) projects.save(fresh);
+
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("microserviceId", microserviceId);
+        out.put("deploymentId",   deploymentId);
+        out.put("repoFullName",   fresh.getPipelineRepoFullName());
+        out.put("repoUrl",        fresh.getPipelineRepoUrl());
+        out.put("branch",         branch);
+        out.put("status",         data.getOrDefault("status", "TRIGGERED"));
+        out.put("artifactUrlMode", mirrorOut.get("artifactUrlMode"));
+        out.put("message",        data.getOrDefault("message",
+                "Pipeline triggered — repository will be created and deployed shortly."));
+        return out;
+    }
+
+    private static String truncate(String s, int max) {
+        if (s == null) return null;
+        return s.length() <= max ? s : s.substring(0, max) + "…";
     }
 
     /**
@@ -908,6 +1159,77 @@ public class MicroserviceBridgeService {
         }
     }
 
+    /** Root node holding {@code strategies} / {@code pipelineConfigs} —
+     *  the CICD endpoint sometimes wraps the payload in {@code data}. */
+    private com.fasterxml.jackson.databind.JsonNode cicdRoot(String onboardingId) throws Exception {
+        java.net.http.HttpClient http = java.net.http.HttpClient.newHttpClient();
+        var req = java.net.http.HttpRequest.newBuilder(
+                java.net.URI.create(cicdServiceBaseUrl + "/" + onboardingId + "/all?filtered=true"))
+                .header("Accept", "application/json")
+                .GET().build();
+        var resp = http.send(req, java.net.http.HttpResponse.BodyHandlers.ofString());
+        if (resp.statusCode() != 200) {
+            throw new IllegalStateException("CICD config lookup for onboarding " + onboardingId
+                    + " returned " + resp.statusCode());
+        }
+        com.fasterxml.jackson.databind.JsonNode root = new com.fasterxml.jackson.databind.ObjectMapper()
+                .readTree(resp.body());
+        return root.path("data").has("pipelineConfigs") || root.path("data").has("strategies")
+                ? root.path("data") : root;
+    }
+
+    /**
+     * Reads {@code pipelineConfigs.MCP.scm.{token,orgUser}} from the CICD
+     * profile — the SAME source DeployService uses for the push. Used by the
+     * read-only status poller so it authenticates GitHub Actions reads with
+     * the pipeline's token/org, not a connector. Returns null when the MCP
+     * pipeline isn't configured (caller then falls back to the connector).
+     */
+    private String[] fetchCicdScm(String onboardingId) {
+        if (onboardingId == null || onboardingId.isBlank()) return null;
+        try {
+            com.fasterxml.jackson.databind.JsonNode scm = cicdRoot(onboardingId)
+                    .path("pipelineConfigs").path("MCP").path("scm");
+            String token = scm.path("token").asText(null);
+            String org   = scm.path("orgUser").asText(null);
+            if (token == null || token.isBlank() || org == null || org.isBlank()) return null;
+            return new String[]{ token, org };
+        } catch (Exception e) {
+            log.warn("[runs] CICD scm lookup for onboarding {} failed: {}", onboardingId, e.getMessage());
+            return null;
+        }
+    }
+
+    /**
+     * The branch tagged {@code dev} in the profile's default strategy — the
+     * branch the pipeline pushes the bundle to, and therefore the branch
+     * {@code mcp.yml}'s push-trigger ({@code ${devBranch}}) must be baked to.
+     * Returns null when unresolvable so the generator keeps its "main"
+     * default instead of breaking generation.
+     */
+    public String fetchCicdDevBranch(String onboardingId) {
+        if (onboardingId == null || onboardingId.isBlank()) return null;
+        try {
+            com.fasterxml.jackson.databind.JsonNode strategies = cicdRoot(onboardingId).path("strategies");
+            if (!strategies.isArray() || strategies.isEmpty()) return null;
+            com.fasterxml.jackson.databind.JsonNode def = null;
+            for (var s : strategies) {
+                if (s.path("isDefault").asBoolean(false)) { def = s; break; }
+            }
+            if (def == null) def = strategies.get(0);
+            for (var b : def.path("branches")) {
+                if ("dev".equals(b.path("tag").asText(null))) {
+                    String name = b.path("name").asText(null);
+                    return (name == null || name.isBlank()) ? null : name.trim();
+                }
+            }
+            return null;
+        } catch (Exception e) {
+            log.warn("[bridge] CICD dev-branch lookup for onboarding {} failed: {}", onboardingId, e.getMessage());
+            return null;
+        }
+    }
+
     private void ensureBranchExists(java.net.http.HttpClient http, String orgOrUser, String repo,
                                     String branch, String sourceBranch, String token) {
         if (branch == null || branch.isBlank()) return;
@@ -1141,20 +1463,22 @@ public class MicroserviceBridgeService {
     }
 
     /**
-     * Resolves the connector's saved source branch (the one the wizard
-     * actually pushes to — the CICD profile's "dev" branch, saved on the
-     * connector via the ConnectorModal). Called at {@code generate()} time
-     * so the embedded {@code .github/workflows/mcp.yml}'s push-trigger is
-     * baked in to match, instead of being hardcoded to "main" while the
-     * code actually lands on a different branch.
+     * The branch the pipeline pushes the bundle to — and therefore the
+     * branch {@code .github/workflows/mcp.yml}'s push-trigger
+     * ({@code ${devBranch}}) must be baked to. Called at {@code generate()}
+     * time.
      *
-     * Falls back to "main" whenever a connector isn't resolvable yet
-     * (brand-new project, no connector saved) so generation never breaks —
-     * the workflow just targets "main" until a real connector is saved,
-     * same as the previous hardcoded behaviour.
+     * Source of truth is the CICD profile's default-strategy "dev" branch
+     * (the SAME value DeployService pushes to). The connector's saved
+     * {@code sourceCodeManagement.branch} is only a fallback for legacy
+     * projects that haven't got a CICD profile yet. Falls back to "main"
+     * when nothing resolves so generation never breaks.
      */
     public String resolveDevBranch(McpProject p) {
         try {
+            String fromCicd = fetchCicdDevBranch(p.getOnboardingId());
+            if (fromCicd != null && !fromCicd.isBlank()) return fromCicd.trim();
+
             String connectorId = resolveConnectorId(p);
             if (connectorId == null) return "main";
             org.bson.Document conn = bridgeColl(props.getColl().getConnector())
@@ -1563,24 +1887,43 @@ public class MicroserviceBridgeService {
      * before a first push has happened.
      */
     private GhCreds resolveGitHubCreds(McpProject project) {
-        String connectorId = resolveConnectorId(project);
-        if (connectorId == null) return null;
-        org.bson.Document conn = bridgeColl(props.getColl().getConnector())
-                .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
-                .first();
-        if (conn == null) return null;
-        org.bson.Document scm = conn.get("sourceCodeManagement", org.bson.Document.class);
-        if (scm == null) return null;
-        String token = scm.getString("token");
-        String orgOrUser = scm.getString("orgOrUser");
-        String repo = null;
-        if (project.getPushedRepoFullName() != null && !project.getPushedRepoFullName().isBlank()) {
-            String[] parts = project.getPushedRepoFullName().split("/", 2);
-            repo = parts.length == 2 ? parts[1] : project.getPushedRepoFullName();
+        // ─── repo ───────────────────────────────────────────────────────
+        // Pipeline path records "<org>/<repo>" on pipelineRepoFullName at
+        // dispatch time; the legacy direct-push path uses pushedRepoFullName.
+        String repoFull = firstNonBlank(project.getPipelineRepoFullName(), project.getPushedRepoFullName());
+        String repo = null, repoOrg = null;
+        if (repoFull != null) {
+            String[] parts = repoFull.split("/", 2);
+            if (parts.length == 2) { repoOrg = parts[0]; repo = parts[1]; }
+            else repo = repoFull;
         }
-        if (repo == null || repo.isBlank()) {
-            repo = scm.getString("repo");
+
+        // ─── token + org: CICD "MCP" pipeline profile first ──────────────
+        String token = null, orgOrUser = null;
+        String[] cicdScm = fetchCicdScm(project.getOnboardingId());
+        if (cicdScm != null) {
+            token = cicdScm[0];
+            orgOrUser = cicdScm[1];
+        } else {
+            // Fallback for legacy direct-push projects: the saved connector.
+            String connectorId = resolveConnectorId(project);
+            if (connectorId != null) {
+                org.bson.Document conn = bridgeColl(props.getColl().getConnector())
+                        .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
+                        .first();
+                org.bson.Document scm = conn == null ? null
+                        : conn.get("sourceCodeManagement", org.bson.Document.class);
+                if (scm != null) {
+                    token = scm.getString("token");
+                    orgOrUser = scm.getString("orgOrUser");
+                    if (repo == null || repo.isBlank()) repo = scm.getString("repo");
+                }
+            }
         }
+
+        // Prefer the org that actually owns the repo when we know it.
+        if (repoOrg != null && !repoOrg.isBlank()) orgOrUser = repoOrg;
+
         if (token == null || orgOrUser == null || repo == null || repo.isBlank()) return null;
         return new GhCreds(token, orgOrUser, repo);
     }

@@ -63,21 +63,28 @@ public class DeployStatusReaper {
     @Scheduled(fixedDelay = 15_000L, initialDelay = 10_000L)
     public void tick() {
         Instant cutoff = Instant.now().minus(24, ChronoUnit.HOURS);
-        List<McpProject> candidates;
+        // Two candidate sets, de-duplicated by id:
+        //   • pipeline deploys  → pipelineRepoFullName set at dispatch time
+        //   • legacy direct push → pushedCommitSha set after a Git Data push
+        java.util.Map<String, McpProject> candidates = new java.util.LinkedHashMap<>();
         try {
-            candidates = projects.findByPushedCommitShaNotNull();
+            for (McpProject p : projects.findByPipelineRepoFullNameNotNull()) {
+                if (p.getId() != null) candidates.put(p.getId(), p);
+            }
+            for (McpProject p : projects.findByPushedCommitShaNotNull()) {
+                if (p.getId() != null) candidates.putIfAbsent(p.getId(), p);
+            }
         } catch (Exception ex) {
             log.warn("[reaper] candidate query failed: {}", ex.getMessage());
             return;
         }
         int polled = 0, recorded = 0;
-        for (McpProject p : candidates) {
-            // Bound the working set: skip projects whose last push is
-            // older than 24 h. Anyone re-opening such a project will
-            // still trigger an on-demand poll via the UI's
-            // `/workflow-runs/latest` GET — the reaper is for FRESH
-            // pushes whose users may have closed the tab.
-            if (p.getPushedAt() != null && p.getPushedAt().isBefore(cutoff)) continue;
+        for (McpProject p : candidates.values()) {
+            // Bound the working set: skip projects whose last deploy trigger /
+            // push is older than 24 h. Re-opening such a project still triggers
+            // an on-demand poll via the UI's `/workflow-runs/latest` GET.
+            Instant last = p.getDeployTriggeredAt() != null ? p.getDeployTriggeredAt() : p.getPushedAt();
+            if (last != null && last.isBefore(cutoff)) continue;
             try {
                 polled++;
                 if (pollOne(p)) recorded++;

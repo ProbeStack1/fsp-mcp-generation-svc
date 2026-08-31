@@ -158,6 +158,24 @@ public class McpProject {
     private Instant mirroredAt;                     // last successful mirror write
 
     /**
+     * Pipeline-deploy state — populated when `POST /projects/{id}/push-to-github`
+     * runs the pipeline path (mirror → api-development `deploy-to-github` →
+     * ForgeCrux `onboarding.yml`). The pipeline creates the repo and pushes,
+     * so the repo/branch are recorded here at dispatch time (NOT after a
+     * direct push) so the status poller / reaper can find the workflow run.
+     */
+    private String  repositoryName;                 // collision-free repo name we asked the pipeline to create
+    private String  pipelineRepoFullName;           // "<org>/<repo>" resolved from CICD + repositoryName
+    private String  pipelineRepoUrl;                // https://github.com/<org>/<repo>
+    private String  pipelineBranch;                 // dev branch the pipeline pushed to (== mcp.yml ${devBranch})
+    private String  deploymentId;                   // api-development DeploymentHistory id from the dispatch response
+    private Instant deployTriggeredAt;              // when we dispatched the pipeline (bounds the reaper working set)
+    /** Which artifact URL the mirror handed the pipeline: ENDPOINT (our
+     *  /artifact.zip proxy) or SIGNED (a long-TTL V4 GCS signed URL) —
+     *  chosen by a preflight on the endpoint at dispatch time. */
+    private String  artifactUrlMode;
+
+    /**
      * The connector's configured source branch (e.g. the CICD profile's
      * "dev" branch), resolved fresh at every {@code generate()} call so
      * the embedded GitHub Actions workflow's push-trigger always targets

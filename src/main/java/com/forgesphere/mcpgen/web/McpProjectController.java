@@ -14,6 +14,7 @@ import com.forgesphere.mcpgen.service.MicroserviceBridgeService;
 import lombok.RequiredArgsConstructor;
 import org.springframework.core.io.ByteArrayResource;
 import org.springframework.http.HttpHeaders;
+import org.springframework.http.HttpStatus;
 import org.springframework.http.MediaType;
 import org.springframework.http.ResponseEntity;
 import org.springframework.web.bind.annotation.*;
@@ -424,13 +425,15 @@ public class McpProjectController {
     }
 
     /**
-     * Push the generated MCP code DIRECTLY to the user's GitHub repo
-     * using the token from the connector linked to this project. This
-     * is the endpoint the wizard calls on "Push & Deploy" — it solves
-     * the "repo is empty" problem caused by the  api-development
-     * team's template-repo+workflow_dispatch flow.
+     * "Push & Deploy" — the endpoint the wizard calls.
      *
-     * Returns `{ repoFullName, repoUrl, branch, pushedCount, failedCount, pushedFiles, failedFiles }`.
+     * DEFAULT (feature flag {@code mcpgen.deploy.pipeline-enabled=true}):
+     *   pipeline path — {@code mirror()} then fsp-api-development-svc's
+     *   {@code deploy-to-github}, which dispatches ForgeCrux/ps-onboarding's
+     *   onboarding.yml to create the repo + push. The repo's own
+     *   {@code .github/workflows/mcp.yml} then deploys to Cloud Run.
+     *
+     * FALLBACK (flag off): legacy direct Git Data API push to the user's repo.
      */
     @PostMapping("/{id}/push-to-github")
     public Envelope<Map<String, Object>> pushToGithub(@PathVariable String id,
@@ -439,29 +442,58 @@ public class McpProjectController {
         String actorEmail = body == null ? null : (String) body.get("updatedBy");
         if ((actorEmail == null || actorEmail.isBlank()) && body != null) actorEmail = (String) body.get("createdBy");
 
+        boolean pipeline = bridgeSvc.isPipelineDeployEnabled();
         Map<String, Object> result;
         String status = "success";
         String error = null;
         try {
-            result = bridgeSvc.pushToGitHub(p);
+            result = pipeline ? bridgeSvc.deployViaPipeline(p, actorEmail)
+                              : bridgeSvc.pushToGitHub(p);
         } catch (Exception ex) {
             status = "failed";
             error  = ex.getMessage();
             result = new LinkedHashMap<>();
             result.put("error", error);
         }
-        // Re-fetch to pick up the bridge's side-effect writes (commitSha
-        // is written by the bridge on pushedCommitSha after `save`).
+        // Re-fetch to pick up the bridge's side-effect writes.
         p = svc.get(id).orElse(p);
         if (actorEmail != null && !actorEmail.isBlank()) p.setUpdatedBy(actorEmail);
-        Integer pushed = (Integer) result.getOrDefault("pushedCount", null);
-        audit.recordPush(p, actorFromBody(actorEmail, p),
-                p.getPushedRepoFullName(), p.getPushedRepoUrl(),
-                p.getPushedBranch(), p.getPushedCommitSha(),
-                pushed, status, error);
+
+        if (pipeline) {
+            Integer fileCount = result.get("fileCount") instanceof Number n ? n.intValue() : null;
+            audit.recordPush(p, actorFromBody(actorEmail, p),
+                    p.getPipelineRepoFullName(), p.getPipelineRepoUrl(),
+                    p.getPipelineBranch(), null,
+                    fileCount, status, error);
+        } else {
+            Integer pushed = (Integer) result.getOrDefault("pushedCount", null);
+            audit.recordPush(p, actorFromBody(actorEmail, p),
+                    p.getPushedRepoFullName(), p.getPushedRepoUrl(),
+                    p.getPushedBranch(), p.getPushedCommitSha(),
+                    pushed, status, error);
+        }
         audit.save(p);
         if ("failed".equals(status)) return Envelope.fail(error);
         return Envelope.ok(result);
+    }
+
+    /**
+     * Stable bundle-download URL handed to the onboarding pipeline as
+     * {@code ZIP_URL}. 302-redirects to a freshly V4-signed GCS URL on
+     * every hit, so a pipeline run that sits queued for hours — or is
+     * retried — still fetches a live link. {@code curl -L} (what
+     * onboarding.yml uses) follows the redirect transparently.
+     */
+    @GetMapping("/{id}/artifact.zip")
+    public ResponseEntity<Void> artifactZip(@PathVariable String id) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        String signed = bridgeSvc.freshSignedBundleUrl(p);
+        if (signed == null) {
+            return ResponseEntity.notFound().build();
+        }
+        return ResponseEntity.status(HttpStatus.FOUND)
+                .location(java.net.URI.create(signed))
+                .build();
     }
 
     /**

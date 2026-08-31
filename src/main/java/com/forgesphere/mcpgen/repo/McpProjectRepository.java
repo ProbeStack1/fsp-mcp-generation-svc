@@ -38,6 +38,17 @@ public interface McpProjectRepository extends MongoRepository<McpProject, String
      * for a repo we never pushed to. We additionally filter by `pushedAt`
      * within the last 24 h (handled in service code) to keep the working
      * set bounded.
+     *
+     * (Legacy direct-push path — kept so a repo pushed via Git Data API
+     * still gets polled.)
      */
     List<McpProject> findByPushedCommitShaNotNull();
+
+    /**
+     * Pipeline-deploy path candidates: the onboarding pipeline creates the
+     * repo, so `pushedCommitSha` is never set by us — instead we record
+     * `pipelineRepoFullName` at dispatch time. Same 24 h `deployTriggeredAt`
+     * bound is applied in service code.
+     */
+    List<McpProject> findByPipelineRepoFullNameNotNull();
 }
