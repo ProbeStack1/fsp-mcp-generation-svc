@@ -186,6 +186,16 @@ public class McpProject {
     @Transient
     private String  devBranch;
 
+    /**
+     * The "merge-to" branch name from the CICD default strategy — the
+     * branch whose {@code tag == "merge"} (e.g. "release"). Baked into the
+     * generated {@code mcp.yml} as {@code branch_tag} for the pipeline's
+     * merge/promote step. Recomputed at every {@code generate()}; not
+     * persisted. Empty when unresolvable.
+     */
+    @Transient
+    private String  branchTag;
+
     private String  pushedRepoFullName;             // e.g. "ForgeCrux/offer-subscription-sf"
     private String  pushedRepoUrl;
     private String  pushedBranch;

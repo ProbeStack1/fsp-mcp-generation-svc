@@ -1230,6 +1230,37 @@ public class MicroserviceBridgeService {
         }
     }
 
+    /**
+     * The {@code name} of the branch tagged {@code merge} ("Merge-To Branch",
+     * e.g. "release") in the profile's default strategy. Baked into the
+     * generated {@code mcp.yml} as {@code branch_tag}. Empty string when
+     * unresolvable so the workflow just carries a blank value rather than
+     * failing generation.
+     */
+    public String resolveBranchTag(McpProject p) {
+        String onboardingId = p == null ? null : p.getOnboardingId();
+        if (onboardingId == null || onboardingId.isBlank()) return "";
+        try {
+            com.fasterxml.jackson.databind.JsonNode strategies = cicdRoot(onboardingId).path("strategies");
+            if (!strategies.isArray() || strategies.isEmpty()) return "";
+            com.fasterxml.jackson.databind.JsonNode def = null;
+            for (var s : strategies) {
+                if (s.path("isDefault").asBoolean(false)) { def = s; break; }
+            }
+            if (def == null) def = strategies.get(0);
+            for (var b : def.path("branches")) {
+                if ("merge".equals(b.path("tag").asText(null))) {
+                    String name = b.path("name").asText(null);
+                    return (name == null || name.isBlank()) ? "" : name.trim();
+                }
+            }
+            return "";
+        } catch (Exception e) {
+            log.warn("[bridge] CICD merge-branch lookup for onboarding {} failed: {}", onboardingId, e.getMessage());
+            return "";
+        }
+    }
+
     private void ensureBranchExists(java.net.http.HttpClient http, String orgOrUser, String repo,
                                     String branch, String sourceBranch, String token) {
         if (branch == null || branch.isBlank()) return;

@@ -62,6 +62,12 @@ env:
   HEALTH_PATH:                   "${healthPath}"
   MCP_LANGUAGE:                  ${language}
   MCP_CONNECTOR_ID:              "${connectorId}"
+  #   branch_name    — the concrete branch this run is on (resolved at runtime).
+  #   branch_tag     — CICD default-strategy "merge" branch name (e.g. release).
+  #   cicd_config_id — id for the CICD filtered-config API (/cicd-config/{id}/all).
+  branch_name:                   ${{ github.ref_name }}
+  branch_tag:                    "${branchTag}"
+  cicd_config_id:                "${cicdConfigId}"
 
 jobs:
   # ───────────────────────────── 1. Test ─────────────────────────────

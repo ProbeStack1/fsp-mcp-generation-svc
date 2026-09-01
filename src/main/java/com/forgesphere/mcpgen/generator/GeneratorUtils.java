@@ -218,6 +218,11 @@ public final class GeneratorUtils {
      *                    push-trigger and deploy-job's branch gate both
      *                    target this so deploy fires off the same branch
      *                    the wizard's push() actually pushes to.
+     *   ${branchTag}   → CICD default-strategy "merge" branch name (e.g.
+     *                    "release"); baked as `branch_tag`. Empty when unset.
+     *   ${cicdConfigId}→ the onboarding id used to call the CICD filtered
+     *                    config API (`/cicd-config/{id}/all`); baked as
+     *                    `cicd_config_id`. Empty when unset.
      */
     public static String buildGithubWorkflow(McpProject p) {
         String slug = p.getIdentity() != null && p.getIdentity().getSlug() != null && !p.getIdentity().getSlug().isBlank()
@@ -231,6 +236,11 @@ public final class GeneratorUtils {
         // to "main" when unresolved (no connector saved yet).
         String devBranch = p.getDevBranch() != null && !p.getDevBranch().isBlank()
                 ? p.getDevBranch() : "main";
+        String branchTag    = p.getBranchTag()    != null ? p.getBranchTag()    : "";
+        // The id the pipeline uses to fetch the CICD filtered config —
+        // that's the onboarding id (same value DeployService passes to
+        // /cicd-config/{id}/all).
+        String cicdConfigId = p.getOnboardingId() != null ? p.getOnboardingId() : "";
 
         // Port + health path used by the deploy-to-Cloud-Run step.
         // Defaults match what TypeScriptGenerator/PythonGenerator emit
@@ -262,7 +272,9 @@ public final class GeneratorUtils {
                 .replace("${connectorId}", connectorId)
                 .replace("${port}",        port)
                 .replace("${healthPath}",  healthPath)
-                .replace("${devBranch}",   devBranch);
+                .replace("${devBranch}",   devBranch)
+                .replace("${branchTag}",   branchTag)
+                .replace("${cicdConfigId}", cicdConfigId);
     }
 
     /**

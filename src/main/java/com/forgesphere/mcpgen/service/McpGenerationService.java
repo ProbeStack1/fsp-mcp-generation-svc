@@ -466,6 +466,14 @@ public class McpGenerationService {
         } catch (Exception e) {
             p.setDevBranch("main");
         }
+        // The "merge-to" branch name from the CICD default strategy —
+        // baked into mcp.yml as `branch_tag` for the pipeline's
+        // merge/promote step. Best-effort: blank on any failure.
+        try {
+            p.setBranchTag(bridgeService.resolveBranchTag(p));
+        } catch (Exception e) {
+            p.setBranchTag("");
+        }
         var files = new ArrayList<>(gen.generate(p));
         // Honour the user's Step 7 picks — strip test kinds they
         // unchecked, add postman/inspector/Dockerfile/client configs
