@@ -268,7 +268,7 @@ public final class GeneratorUtils {
                 .replace("${slug}",        slug)
                 .replace("${language}",    lang)
                 .replace("${langSteps}",   buildLanguageSteps(lang))
-                .replace("${langEnvVars}", buildLanguageEnvVars(lang))
+                .replace("${langEnvVars}", buildLanguageEnvVars(p, lang))
                 .replace("${connectorId}", connectorId)
                 .replace("${port}",        port)
                 .replace("${healthPath}",  healthPath)
@@ -281,13 +281,34 @@ public final class GeneratorUtils {
      * Per-language `--set-env-vars` payload for the Cloud Run deploy
      * step. Different runtimes have different conventional env vars; we
      * keep this list focused so the deploy line stays readable.
+     *
+     * <p>When the project uses bearer / api-key auth we ALSO inject the
+     * token here ({@code MCP_AUTH_TOKEN} / {@code MCP_API_KEY}). The
+     * generated server's auth middleware reads it from the environment,
+     * and the {@code .env} that carries it in dev is {@code .gitignore}d
+     * — so the onboarding pipeline (which does {@code git add .}) never
+     * ships it, and the deployed server would 401 every request with
+     * {@code {"error":"unauthorized"}}. This is the same token the Test
+     * page / MCP inspector sends, so the two always agree.
      */
-    private static String buildLanguageEnvVars(String language) {
-        return switch (language) {
+    private static String buildLanguageEnvVars(McpProject p, String language) {
+        String base = switch (language) {
             case "python" -> "PYTHONUNBUFFERED=1,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}";
             case "java"   -> "SPRING_PROFILES_ACTIVE=cloud,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}";
             default       -> "NODE_ENV=production,MCP_SERVER_NAME=${{ env.SERVICE_NAME }},MCP_CONNECTOR_ID=${MCP_CONNECTOR_ID}";
         };
+
+        var a = p == null ? null : p.getAuth();
+        if (a != null && a.getGeneratedToken() != null && !a.getGeneratedToken().isBlank()) {
+            String kind  = a.getKind() == null ? "" : a.getKind().trim().toLowerCase();
+            String token = a.getGeneratedToken().trim();
+            if ("bearer".equals(kind)) {
+                base += ",MCP_AUTH_TOKEN=" + token;
+            } else if ("api-key".equals(kind) || "apikey".equals(kind)) {
+                base += ",MCP_API_KEY=" + token;
+            }
+        }
+        return base;
     }
 
     /** Best-effort classpath read; returns {@code null} on any error. */
