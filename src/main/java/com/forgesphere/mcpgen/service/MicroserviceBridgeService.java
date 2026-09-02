@@ -1980,6 +1980,7 @@ public class MicroserviceBridgeService {
             out.put("runId", firstRun.get("id"));
             out.put("headSha", firstRun.get("headSha"));
             out.put("headBranch", firstRun.get("headBranch"));
+            out.put("runNumber", firstRun.get("runNumber"));
             out.put("deploymentStatus", deployStatus);
             if (project.getDeployedServiceUrl() != null) {
                 out.put("deployedServiceUrl", project.getDeployedServiceUrl());
@@ -2452,6 +2453,7 @@ public class MicroserviceBridgeService {
         out.put("updatedAt",     extractString (slice, "updated_at"));
         out.put("headSha",       extractString (slice, "head_sha"));
         out.put("headBranch",    extractString (slice, "head_branch"));
+        out.put("runNumber",     extractLong   (slice, "run_number"));
         return out;
     }
 
