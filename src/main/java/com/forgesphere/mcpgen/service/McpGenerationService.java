@@ -135,6 +135,7 @@ public class McpGenerationService {
         if (patch.getSpecMetadataId() != null) cur.setSpecMetadataId(patch.getSpecMetadataId());
         if (patch.getSpecName()       != null) cur.setSpecName(patch.getSpecName());
         if (patch.getSpecSource()     != null) cur.setSpecSource(patch.getSpecSource());
+        if (patch.getTestRunResults() != null) cur.setTestRunResults(patch.getTestRunResults());
         cur.setUpdatedAt(Instant.now());
         return repo.save(cur);
     }
@@ -229,34 +230,9 @@ public class McpGenerationService {
         copy.setDeprecatedAt(null);
         copy.setDeprecatedBy(null);
         copy.setDeprecationReason(null);
-        // Reset everything that's tied to a specific push/deploy lifecycle.
-        copy.setMicroserviceMirrorId(null);
-        copy.setDeploymentArtifactId(null);
-        copy.setCodeGenResultId(null);
-        copy.setGcsArchivePath(null);
-        copy.setMirroredAt(null);
-        copy.setPushedRepoFullName(null);
-        copy.setPushedRepoUrl(null);
-        copy.setPushedBranch(null);
-        copy.setPushedCommitSha(null);
-        copy.setPushedActionsUrl(null);
-        copy.setPushedFileCount(null);
-        copy.setPushedAt(null);
-        copy.setLatestRunId(null);
-        copy.setLatestRunStatus(null);
-        copy.setLatestRunConclusion(null);
-        copy.setLatestRunUrl(null);
-        copy.setLatestRunCheckedAt(null);
-        copy.setDeployedServiceUrl(null);
-        copy.setDeployedAt(null);
-        copy.setZipObjectPath(null);
-        copy.setZipBytes(null);
-        copy.setZipContentType(null);
-        copy.setZipUploadedAt(null);
-        copy.setLastDownloadedAt(null);
-        copy.setStepCompletion(new java.util.ArrayList<>());
-        copy.setRunHistory(new java.util.ArrayList<>());
-        copy.setAuditTrail(null);
+        // Reset everything that's tied to a specific generate/push/deploy
+        // lifecycle so the clone re-enters the wizard at "needs generate".
+        resetLifecycleState(copy);
         // Slug nudge so the clone doesn't collide with the original in the same workspace.
         if (copy.getIdentity() != null) {
             String slug = newSlug != null && !newSlug.isBlank()
@@ -305,24 +281,15 @@ public class McpGenerationService {
         copy.setVersionNumber(newVersion != null && !newVersion.isBlank()
                 ? newVersion
                 : nextSemver(src.getVersionNumber()));
-        // A new version starts fresh on the deploy lifecycle.
-        copy.setMicroserviceMirrorId(null);
-        copy.setDeploymentArtifactId(null);
-        copy.setCodeGenResultId(null);
-        copy.setGcsArchivePath(null);
-        copy.setMirroredAt(null);
-        copy.setPushedCommitSha(null);
-        copy.setPushedAt(null);
-        copy.setLatestRunId(null);
-        copy.setLatestRunStatus(null);
+        // A new version starts fresh on the whole generate/push/deploy
+        // lifecycle — identical reset to clone() so the two never drift.
+        resetLifecycleState(copy);
         copy.setSoftDeleted(false);
         copy.setDeleteEvent(null);
         copy.setDeprecated(false);
         copy.setDeprecatedAt(null);
         copy.setDeprecatedBy(null);
-        copy.setStepCompletion(new java.util.ArrayList<>());
-        copy.setRunHistory(new java.util.ArrayList<>());
-        copy.setAuditTrail(null);
+        copy.setDeprecationReason(null);
         Instant now = Instant.now();
         copy.setCreatedAt(now);
         copy.setUpdatedAt(now);
@@ -344,6 +311,63 @@ public class McpGenerationService {
         }
 
         return savedCopy;
+    }
+
+    /**
+     * Null out every field tied to one specific generate → push → deploy
+     * lifecycle. Shared by {@link #clone} and {@link #version} so a fresh copy
+     * always re-enters the wizard at "needs generate" with no stale mirror ids,
+     * pipeline repo pointers, GitHub-Actions run status, deployed URLs, cached
+     * bundle zip or Step-8 test results carried over from its parent. Keeping
+     * this in one place means a newly added lifecycle field only has to be
+     * reset once for both operations.
+     */
+    private static void resetLifecycleState(McpProject copy) {
+        // Mongo mirror docs (codegen_results / microservice / deployment_artifacts)
+        copy.setMicroserviceMirrorId(null);
+        copy.setDeploymentArtifactId(null);
+        copy.setCodeGenResultId(null);
+        copy.setGcsArchivePath(null);
+        copy.setMirroredAt(null);
+        // Pipeline deploy pointers (fsp-api-development-svc dispatch)
+        copy.setRepositoryName(null);
+        copy.setPipelineRepoFullName(null);
+        copy.setPipelineRepoUrl(null);
+        copy.setPipelineBranch(null);
+        copy.setDeploymentId(null);
+        copy.setDeployTriggeredAt(null);
+        copy.setArtifactUrlMode(null);
+        // Legacy direct-push metadata
+        copy.setPushedRepoFullName(null);
+        copy.setPushedRepoUrl(null);
+        copy.setPushedBranch(null);
+        copy.setPushedCommitSha(null);
+        copy.setPushedActionsUrl(null);
+        copy.setPushedFileCount(null);
+        copy.setPushedAt(null);
+        // GitHub Actions run tracking
+        copy.setLatestRunId(null);
+        copy.setLatestRunStatus(null);
+        copy.setLatestRunConclusion(null);
+        copy.setLatestRunUrl(null);
+        copy.setLatestRunCheckedAt(null);
+        // Deployed endpoints
+        copy.setDeployedServiceUrl(null);
+        copy.setDeployedMcpUrl(null);
+        copy.setDeployedHealthUrl(null);
+        copy.setDeployedAt(null);
+        // Cached bundle zip
+        copy.setZipObjectPath(null);
+        copy.setZipBytes(null);
+        copy.setZipContentType(null);
+        copy.setZipUploadedAt(null);
+        copy.setLastDownloadedAt(null);
+        // Step-8 test-run results are tied to the parent's generated code
+        copy.setTestRunResults(null);
+        // Wizard progress + history restart
+        copy.setStepCompletion(new java.util.ArrayList<>());
+        copy.setRunHistory(new java.util.ArrayList<>());
+        copy.setAuditTrail(null);
     }
 
     /**

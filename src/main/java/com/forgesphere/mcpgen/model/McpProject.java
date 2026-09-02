@@ -204,6 +204,14 @@ public class McpProject {
     private Integer pushedFileCount;
     private Instant pushedAt;
 
+    /**
+     * Step 8 (Test Cases) run outcomes, keyed by {@code "<toolName>-<category>"}.
+     * Persisted so the pass/fail counts survive leaving the wizard step (or a
+     * full page reload) instead of resetting to zero. Shape is opaque to the
+     * backend — the wizard owns it.
+     */
+    private java.util.Map<String, Object> testRunResults;
+
     private String  latestRunId;                    // GitHub Actions run id
     private String  latestRunStatus;                // queued|in_progress|completed
     private String  latestRunConclusion;            // success|failure|cancelled|null

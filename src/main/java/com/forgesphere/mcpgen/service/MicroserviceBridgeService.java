@@ -284,7 +284,8 @@ public class MicroserviceBridgeService {
         //     microservice flow, which reads microservice.repositoryName in
         //     DeployService.buildDeployContext (no collision check there —
         //     onboarding.yml clones-or-reuses an existing repo of that name).
-        String repositoryName = firstNonBlank(mcp.getRepositoryName(), deriveRepoNameFromProject(mcp));
+        String repositoryName = withMcpSuffix(
+                firstNonBlank(mcp.getRepositoryName(), deriveRepoNameFromProject(mcp)));
         mcp.setRepositoryName(repositoryName);
 
         log.info("[bridge] mirroring project={} → microserviceId={} artifactId={} codeGenResultId={} repo={} files={}",
@@ -979,17 +980,33 @@ public class MicroserviceBridgeService {
      */
     private String deriveRepoNameFromProject(McpProject mcp) {
         McpProject.Identity id = mcp.getIdentity();
+        String base;
         if (id != null && id.getSlug() != null && !id.getSlug().isBlank()) {
-            return id.getSlug().trim();
-        }
-        if (id != null && id.getDisplayName() != null && !id.getDisplayName().isBlank()) {
+            base = id.getSlug().trim();
+        } else if (id != null && id.getDisplayName() != null && !id.getDisplayName().isBlank()) {
             String sanitised = id.getDisplayName().toLowerCase().trim()
                     .replaceAll("[^a-z0-9]+", "-")
                     .replaceAll("^-+|-+$", "");
-            if (!sanitised.isBlank()) return sanitised;
+            base = sanitised.isBlank()
+                    ? "mcp-server-" + (mcp.getId() != null ? mcp.getId() : UUID.randomUUID().toString())
+                    : sanitised;
+        } else {
+            base = "mcp-server-" + (mcp.getId() != null ? mcp.getId() : UUID.randomUUID().toString());
         }
-        String suffix = mcp.getId() != null ? mcp.getId() : UUID.randomUUID().toString();
-        return "mcp-server-" + suffix;
+        return withMcpSuffix(base);
+    }
+
+    /**
+     * MCP repos always end in {@code -mcp} — the same convention Apigee
+     * proxies ({@code -px}) / shared-flows ({@code -sf}) / Kong services
+     * ({@code -kgs}) use, so the same OpenAPI spec generating both a
+     * microservice AND an MCP server doesn't collide on one repo name.
+     * Idempotent — never doubles the suffix.
+     */
+    private static String withMcpSuffix(String name) {
+        if (name == null || name.isBlank()) return "mcp-server-mcp";
+        String n = name.trim();
+        return n.toLowerCase().endsWith("-mcp") ? n : n + "-mcp";
     }
 
     /**
