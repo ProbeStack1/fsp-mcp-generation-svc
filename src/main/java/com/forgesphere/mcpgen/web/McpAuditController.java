@@ -38,7 +38,11 @@ public class McpAuditController {
     @GetMapping("/{id}/audit")
     public Envelope<AuditTrail> audit(@PathVariable String id) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
-        return Envelope.ok(audit.ensure(p));
+        AuditTrail a = audit.ensure(p);
+        // Cheap self-heal: reconcile a stuck "Pending" deploy entry against the
+        // project's own latestRun* / deployedServiceUrl fields (no GitHub call).
+        if (audit.resolvePendingDeploy(p, audit.fallbackActor(p))) audit.save(p);
+        return Envelope.ok(a);
     }
 
     /**
@@ -63,9 +67,11 @@ public class McpAuditController {
         result.put("projectId", p.getId());
 
         int beforeCount = audit.ensure(p).getDeployHistory().size();
-        // Delegate to the same reaper that the scheduler uses so we
-        // never diverge between manual + automatic reconciliation.
-        boolean wrote = reaper.pollOneForController(p);
+        // First heal from the doc's own fields (free), then delegate to the
+        // reaper for a fresh GitHub sighting.
+        boolean healed = audit.resolvePendingDeploy(p, audit.fallbackActor(p));
+        if (healed) audit.save(p);
+        boolean wrote = reaper.pollOneForController(p) || healed;
         // Re-fetch to get the absolute latest counters after the write.
         McpProject fresh = svc.get(id).orElse(p);
         var trail = audit.ensure(fresh);
@@ -82,6 +88,7 @@ public class McpAuditController {
     public Envelope<Map<String, Object>> deployments(@PathVariable String id) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
         AuditTrail a = audit.ensure(p);
+        if (audit.resolvePendingDeploy(p, audit.fallbackActor(p))) audit.save(p);
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("total",         a.getTotalDeploys());
         out.put("totalSuccess",  a.getTotalDeploysSuccess());

@@ -101,8 +101,16 @@ public class McpProjectController {
 
     @GetMapping("/{id}")
     public Envelope<McpProject> get(@PathVariable String id) {
-        return svc.get(id).map(Envelope::ok)
-                .orElse(Envelope.fail("project not found: " + id));
+        return svc.get(id).map(p -> {
+            // Cheap self-heal (no network): reconcile a stuck "Pending" deploy
+            // entry against the doc's own latestRun*/deployedServiceUrl fields
+            // so the API Deploy view never sits on "Pending" for a finished
+            // deploy. Only writes when something actually changed.
+            try {
+                if (audit.resolvePendingDeploy(p, audit.fallbackActor(p))) audit.save(p);
+            } catch (Exception ignore) { /* never fail a read on a heal hiccup */ }
+            return Envelope.ok(p);
+        }).orElse(Envelope.fail("project not found: " + id));
     }
 
     @PutMapping("/{id}")

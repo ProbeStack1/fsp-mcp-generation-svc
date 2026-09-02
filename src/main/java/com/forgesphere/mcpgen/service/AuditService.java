@@ -160,6 +160,77 @@ public class AuditService {
     }
 
     /**
+     * Self-heal a pending ({@code queued}, no {@code runId}, or mid-flight)
+     * deploy entry from the project doc's OWN {@code latestRun*} /
+     * {@code deployedServiceUrl} fields — which the wizard's push/deploy poll
+     * already populates. This closes the gap where a deploy finished but the
+     * reaper never got a fresh GitHub sighting to adopt the seeded entry, so
+     * the timeline stayed stuck on "Pending" and rollback stayed unavailable.
+     *
+     * <p>No network call — purely reconciles two places on the same document.
+     * Returns {@code true} if it changed anything (caller should persist).</p>
+     */
+    public boolean resolvePendingDeploy(McpProject p, AuditActor actor) {
+        AuditTrail a = ensure(p);
+
+        DeployEntry pending = null;
+        for (DeployEntry de : a.getDeployHistory()) {
+            if (de.getRolledBackFrom() == null && !isTerminal(de)) pending = de; // newest non-terminal
+        }
+        if (pending == null) return false;
+
+        String runId      = p.getLatestRunId();
+        String runUrl     = p.getLatestRunUrl();
+        String runStatus  = p.getLatestRunStatus();
+        String conclusion = p.getLatestRunConclusion();
+        String deployedUrl = p.getDeployedServiceUrl();
+
+        // Nothing new to pull from the doc.
+        if ((runId == null || runId.isBlank())
+                && (conclusion == null || conclusion.isBlank())
+                && (deployedUrl == null || deployedUrl.isBlank())) {
+            return false;
+        }
+
+        // Infer a terminal state when GitHub's own conclusion wasn't captured
+        // but the service is clearly live (URL present, not still running).
+        boolean running = "queued".equalsIgnoreCase(runStatus) || "in_progress".equalsIgnoreCase(runStatus);
+        if ((conclusion == null || conclusion.isBlank()) && deployedUrl != null && !deployedUrl.isBlank() && !running) {
+            conclusion = "success";
+            runStatus  = "completed";
+        }
+
+        boolean wasTerminal = isTerminal(pending);
+        boolean changed = false;
+
+        if (runId != null && !runId.isBlank() && !runId.equals(pending.getRunId())) {
+            pending.setRunId(runId); changed = true;
+        }
+        if (runUrl != null && !runUrl.isBlank() && !runUrl.equals(pending.getRunUrl())) {
+            pending.setRunUrl(runUrl); changed = true;
+        }
+        if (runStatus != null && !runStatus.isBlank() && !runStatus.equalsIgnoreCase(pending.getStatus())) {
+            pending.setStatus(runStatus); changed = true;
+        }
+        if (conclusion != null && !conclusion.isBlank() && !conclusion.equalsIgnoreCase(pending.getConclusion())) {
+            pending.setConclusion(conclusion); changed = true;
+        }
+        if (deployedUrl != null && !deployedUrl.isBlank() && !deployedUrl.equals(pending.getDeployedUrl())) {
+            pending.setDeployedUrl(deployedUrl); changed = true;
+        }
+        if (pending.getCommitSha() == null && p.getPushedCommitSha() != null) {
+            pending.setCommitSha(p.getPushedCommitSha()); changed = true;
+        }
+
+        if (!wasTerminal && isTerminal(pending)) {
+            bumpTerminalCounter(a, pending.getConclusion());
+            changed = true;
+        }
+        if (changed && actor != null) a.setLastUpdatedBy(actor);
+        return changed;
+    }
+
+    /**
      * Upsert-by-runId variant used by polling paths (controller +
      * scheduled reaper). Semantics that match the user's mental model:
      *

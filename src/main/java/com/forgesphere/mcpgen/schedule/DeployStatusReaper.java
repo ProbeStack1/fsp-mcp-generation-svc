@@ -134,12 +134,17 @@ public class DeployStatusReaper {
      */
     private boolean pollOne(McpProject p) {
         Map<String, Object> out = bridge.getLatestWorkflowRun(p);
-        if (out == null) return false;
+        if (out == null || out.get("runId") == null || String.valueOf(out.get("runId")).isBlank()) {
+            // GitHub gave us nothing this tick — still try to heal a stuck
+            // "Pending" entry from the project's own latestRun* fields.
+            boolean healed = audit.resolvePendingDeploy(p, audit.fallbackActor(p));
+            if (healed) audit.save(p);
+            return healed;
+        }
         String runId      = (String) out.get("runId");
         String status     = (String) out.get("status");
         String conclusion = (String) out.get("conclusion");
         String runUrl     = (String) out.get("htmlUrl");
-        if (runId == null || runId.isBlank()) return false;
 
         // Snapshot the trail BEFORE upsert so we can return whether a
         // meaningful change happened (used by the manual reconcile
