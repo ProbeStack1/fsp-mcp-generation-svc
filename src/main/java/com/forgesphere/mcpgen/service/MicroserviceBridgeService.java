@@ -1975,6 +1975,8 @@ public class MicroserviceBridgeService {
             out.put("repoName", creds.repo);
             out.put("runFound", true);
             out.put("runId", firstRun.get("id"));
+            out.put("headSha", firstRun.get("headSha"));
+            out.put("headBranch", firstRun.get("headBranch"));
             out.put("deploymentStatus", deployStatus);
             if (project.getDeployedServiceUrl() != null) {
                 out.put("deployedServiceUrl", project.getDeployedServiceUrl());
@@ -2088,6 +2090,100 @@ public class MicroserviceBridgeService {
         }
     }
 
+    /**
+     * Per-step log text for one job of a workflow run.
+     *
+     * <p>GitHub only exposes step logs as a ZIP:
+     * {@code GET /actions/jobs/{jobId}/logs} → 302 → a short-lived signed URL
+     * that serves {@code application/zip} with one {@code "<n>_<step name>.txt"}
+     * per step. We follow the redirect ourselves (the blob URL rejects the
+     * {@code Authorization} header), unzip in memory, strip GitHub's per-line
+     * ISO timestamps, tail-truncate each step to keep the payload sane, and
+     * return a list keyed by step number.</p>
+     *
+     * <p>Best-effort: any failure returns {@code steps: []} (+ an {@code error}
+     * string) — the UI just shows its "logs not captured" fallback.</p>
+     *
+     * @return {@code { "jobId": <id>, "steps": [ {number, name, log}, … ] }}
+     */
+    public Map<String, Object> getJobStepLogs(McpProject project, String jobId) {
+        Map<String, Object> out = new LinkedHashMap<>();
+        out.put("jobId", jobId);
+        out.put("steps", java.util.List.of());
+        if (jobId == null || jobId.isBlank()) return out;
+
+        var creds = resolveGitHubCreds(project);
+        if (creds == null) { out.put("error", "No GitHub connector configured"); return out; }
+
+        try {
+            java.net.http.HttpClient noRedirect = java.net.http.HttpClient.newBuilder()
+                    .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
+                    .connectTimeout(java.time.Duration.ofSeconds(10))
+                    .build();
+            String api = "https://api.github.com/repos/" + creds.orgOrUser + "/" + creds.repo
+                    + "/actions/jobs/" + jobId + "/logs";
+            var apiReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(api))
+                    .timeout(java.time.Duration.ofSeconds(20))
+                    .header("Authorization", "Bearer " + creds.token)
+                    .header("Accept", "application/vnd.github+json")
+                    .GET().build();
+            var apiResp = noRedirect.send(apiReq, java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+
+            byte[] zipBytes;
+            int sc = apiResp.statusCode();
+            if (sc == 301 || sc == 302 || sc == 307 || sc == 308) {
+                String loc = apiResp.headers().firstValue("location").orElse(null);
+                if (loc == null || loc.isBlank()) { out.put("error", "No redirect location for job logs"); return out; }
+                var blobResp = java.net.http.HttpClient.newHttpClient().send(
+                        java.net.http.HttpRequest.newBuilder(java.net.URI.create(loc))
+                                .timeout(java.time.Duration.ofSeconds(30)).GET().build(),
+                        java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+                if (blobResp.statusCode() / 100 != 2) { out.put("error", "Log archive fetch failed: " + blobResp.statusCode()); return out; }
+                zipBytes = blobResp.body();
+            } else if (sc / 100 == 2) {
+                zipBytes = apiResp.body();
+            } else {
+                out.put("error", "GitHub job-logs failed: " + sc);
+                return out;
+            }
+
+            java.util.regex.Pattern entryPat = java.util.regex.Pattern.compile("^(\\d+)_(.+?)\\.txt$");
+            java.util.regex.Pattern tsPat =
+                    java.util.regex.Pattern.compile("(?m)^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z\\s?");
+            java.util.Map<Integer, Map<String, Object>> byNumber = new java.util.TreeMap<>();
+            try (java.util.zip.ZipInputStream zis =
+                         new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(zipBytes))) {
+                java.util.zip.ZipEntry e;
+                while ((e = zis.getNextEntry()) != null) {
+                    if (e.isDirectory()) continue;
+                    String base = e.getName().substring(e.getName().lastIndexOf('/') + 1);
+                    var m = entryPat.matcher(base);
+                    if (!m.matches()) continue;
+                    int num = Integer.parseInt(m.group(1));
+                    String stepName = m.group(2).replace('_', ' ');
+                    String text = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                    text = tsPat.matcher(text).replaceAll("");
+                    final int MAX = 60_000;
+                    if (text.length() > MAX) {
+                        text = "…(truncated " + (text.length() - MAX) + " earlier chars)…\n"
+                                + text.substring(text.length() - MAX);
+                    }
+                    Map<String, Object> step = new LinkedHashMap<>();
+                    step.put("number", num);
+                    step.put("name", stepName);
+                    step.put("log", text);
+                    byNumber.put(num, step);
+                }
+            }
+            out.put("steps", new java.util.ArrayList<>(byNumber.values()));
+            return out;
+        } catch (Exception ex) {
+            log.warn("[runs] job-log fetch failed for job {}: {}", jobId, ex.getMessage());
+            out.put("error", ex.getMessage());
+            return out;
+        }
+    }
+
     // Internal connector-credential record returned by resolveGitHubCreds.
     private record GhCreds(String token, String orgOrUser, String repo) {}
 
@@ -2174,6 +2270,8 @@ public class MicroserviceBridgeService {
         out.put("htmlUrl",       extractString (slice, "html_url"));
         out.put("createdAt",     extractString (slice, "created_at"));
         out.put("updatedAt",     extractString (slice, "updated_at"));
+        out.put("headSha",       extractString (slice, "head_sha"));
+        out.put("headBranch",    extractString (slice, "head_branch"));
         return out;
     }
 

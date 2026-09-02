@@ -595,6 +595,15 @@ public class McpProjectController {
         return Envelope.ok(bridgeSvc.getWorkflowRunSteps(p, runId));
     }
 
+    /** Per-step log text for one job of a run (unzipped from GitHub's job-logs archive). */
+    @GetMapping("/{id}/workflow-runs/{runId}/jobs/{jobId}/logs")
+    public Envelope<Map<String, Object>> jobStepLogs(@PathVariable String id,
+                                                     @PathVariable String runId,
+                                                     @PathVariable String jobId) {
+        McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
+        return Envelope.ok(bridgeSvc.getJobStepLogs(p, jobId));
+    }
+
     // ------------- Client configs -------------
     @GetMapping("/{id}/client-configs")
     public Envelope<Map<String, Object>> configs(@PathVariable String id) {

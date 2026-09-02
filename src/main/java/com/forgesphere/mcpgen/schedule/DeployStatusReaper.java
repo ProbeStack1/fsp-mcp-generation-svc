@@ -132,19 +132,25 @@ public class DeployStatusReaper {
      * audit-write logic across two services — when the controller is
      * eventually refactored both paths should call the same helper.
      */
+    private static String str(Object o) { return o == null ? null : String.valueOf(o); }
+
     private boolean pollOne(McpProject p) {
         Map<String, Object> out = bridge.getLatestWorkflowRun(p);
-        if (out == null || out.get("runId") == null || String.valueOf(out.get("runId")).isBlank()) {
+        // `runId` comes back as a Long from the shallow JSON parse — normalise
+        // to String here (a raw `(String) cast` used to ClassCastException and
+        // get swallowed, which is why GitHub-sourced deploy rows never landed).
+        String runId = str(out == null ? null : out.get("runId"));
+        if (runId == null || runId.isBlank()) {
             // GitHub gave us nothing this tick — still try to heal a stuck
             // "Pending" entry from the project's own latestRun* fields.
             boolean healed = audit.resolvePendingDeploy(p, audit.fallbackActor(p));
             if (healed) audit.save(p);
             return healed;
         }
-        String runId      = (String) out.get("runId");
-        String status     = (String) out.get("status");
-        String conclusion = (String) out.get("conclusion");
-        String runUrl     = (String) out.get("htmlUrl");
+        String status     = str(out.get("status"));
+        String conclusion = str(out.get("conclusion"));
+        String runUrl     = str(out.get("htmlUrl"));
+        String headSha    = str(out.get("headSha"));
 
         // Snapshot the trail BEFORE upsert so we can return whether a
         // meaningful change happened (used by the manual reconcile
@@ -199,10 +205,11 @@ public class DeployStatusReaper {
                     .timestamp(Instant.now()).build();
         }
 
+        String commitSha = (headSha != null && !headSha.isBlank()) ? headSha : p.getPushedCommitSha();
         audit.upsertDeployFromPoll(p, actor,
                 runId, runUrl, status, conclusion,
                 p.getDeployedServiceUrl(), null,
-                failedStep, failedReason, p.getPushedCommitSha());
+                failedStep, failedReason, commitSha);
         audit.save(p);
 
         var trailAfter = audit.ensure(p);
