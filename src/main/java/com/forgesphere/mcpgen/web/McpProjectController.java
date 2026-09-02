@@ -465,6 +465,13 @@ public class McpProjectController {
                     p.getPipelineRepoFullName(), p.getPipelineRepoUrl(),
                     p.getPipelineBranch(), null,
                     fileCount, status, error);
+            // Seed a queued deploy entry NOW so the timeline + totalDeploys
+            // reflect the dispatch immediately (microservice-parity). The
+            // reaper/poll adopts this entry once GitHub reports a runId.
+            if ("success".equals(status)) {
+                audit.recordDeployDispatch(p, actorFromBody(actorEmail, p),
+                        p.getPushedCommitSha(), p.getDeployedServiceUrl());
+            }
         } else {
             Integer pushed = (Integer) result.getOrDefault("pushedCount", null);
             audit.recordPush(p, actorFromBody(actorEmail, p),

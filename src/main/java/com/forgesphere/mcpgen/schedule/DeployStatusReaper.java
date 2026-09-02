@@ -81,10 +81,13 @@ public class DeployStatusReaper {
         int polled = 0, recorded = 0;
         for (McpProject p : candidates.values()) {
             // Bound the working set: skip projects whose last deploy trigger /
-            // push is older than 24 h. Re-opening such a project still triggers
-            // an on-demand poll via the UI's `/workflow-runs/latest` GET.
+            // push is older than 24 h — UNLESS they still carry an in-flight
+            // (non-terminal) deploy entry that nobody has resolved yet (e.g. a
+            // queued row seeded at dispatch that never got its GitHub runId).
+            // Re-opening such a project also triggers an on-demand poll via the
+            // UI's `/workflow-runs/latest` GET.
             Instant last = p.getDeployTriggeredAt() != null ? p.getDeployTriggeredAt() : p.getPushedAt();
-            if (last != null && last.isBefore(cutoff)) continue;
+            if (last != null && last.isBefore(cutoff) && !hasInFlightDeploy(p)) continue;
             try {
                 polled++;
                 if (pollOne(p)) recorded++;
@@ -95,6 +98,18 @@ public class DeployStatusReaper {
         if (recorded > 0) {
             log.info("[reaper] polled={} new_audit_rows={}", polled, recorded);
         }
+    }
+
+    /** True if the project has a deploy entry that hasn't reached a terminal state yet. */
+    private static boolean hasInFlightDeploy(McpProject p) {
+        if (p.getAuditTrail() == null || p.getAuditTrail().getDeployHistory() == null) return false;
+        for (McpProject.DeployEntry de : p.getAuditTrail().getDeployHistory()) {
+            if (de.getRolledBackFrom() != null) continue;
+            boolean terminal = "completed".equalsIgnoreCase(de.getStatus())
+                    && de.getConclusion() != null && !de.getConclusion().isBlank();
+            if (!terminal) return true;
+        }
+        return false;
     }
 
     /**

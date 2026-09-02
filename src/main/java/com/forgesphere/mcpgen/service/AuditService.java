@@ -123,6 +123,43 @@ public class AuditService {
     }
 
     /**
+     * Seed a {@code queued} deploy entry the MOMENT a pipeline deploy is
+     * dispatched — so the timeline (and {@code totalDeploys}) reflects the
+     * deploy immediately, exactly like the microservice flow's
+     * {@code deployment_history} row. The scheduled reaper / on-demand poll
+     * later ADOPTS this pending entry (fills in the real GitHub {@code runId}
+     * and terminal status) via {@link #upsertDeployFromPoll}, so no duplicate
+     * row is ever created.
+     *
+     * <p>Idempotent: if a non-terminal entry with no {@code runId} is already
+     * in flight for this project, this is a no-op (a double-dispatch of the
+     * same commit must not add a second row).</p>
+     */
+    public DeployEntry recordDeployDispatch(McpProject p, AuditActor actor,
+                                            String commitSha, String deployedUrl) {
+        AuditTrail a = ensure(p);
+        for (DeployEntry de : a.getDeployHistory()) {
+            if ((de.getRunId() == null || de.getRunId().isBlank())
+                    && de.getRolledBackFrom() == null && !isTerminal(de)) {
+                return de;
+            }
+        }
+        DeployEntry e = DeployEntry.builder().by(actor)
+                .status("queued")
+                .commitSha(commitSha).deployedUrl(deployedUrl)
+                .build();
+        a.getDeployHistory().add(e);
+        a.setTotalDeploys(a.getDeployHistory().size());
+        a.setLastUpdatedBy(actor);
+        return e;
+    }
+
+    private static boolean isTerminal(DeployEntry de) {
+        return "completed".equalsIgnoreCase(de.getStatus())
+                && de.getConclusion() != null && !de.getConclusion().isBlank();
+    }
+
+    /**
      * Upsert-by-runId variant used by polling paths (controller +
      * scheduled reaper). Semantics that match the user's mental model:
      *
@@ -164,6 +201,33 @@ public class AuditService {
                 && conclusion != null && !conclusion.isBlank();
 
         if (existing == null) {
+            // Before inserting a fresh row, see if there's a PENDING entry
+            // seeded by recordDeployDispatch (queued, no runId yet). If so,
+            // ADOPT it — this poll is the first real GitHub sighting of the
+            // deploy that dispatch already counted, so we must not add a
+            // second row or re-bump totalDeploys.
+            DeployEntry pending = null;
+            for (DeployEntry de : a.getDeployHistory()) {
+                if ((de.getRunId() == null || de.getRunId().isBlank())
+                        && de.getRolledBackFrom() == null && !isTerminal(de)) {
+                    pending = de; // newest wins if there were somehow several
+                }
+            }
+            if (pending != null) {
+                pending.setRunId(runId);
+                pending.setRunUrl(runUrl != null ? runUrl : pending.getRunUrl());
+                pending.setStatus(status != null ? status : pending.getStatus());
+                if (conclusion != null && !conclusion.isBlank()) pending.setConclusion(conclusion);
+                if (deployedUrl != null && !deployedUrl.isBlank()) pending.setDeployedUrl(deployedUrl);
+                if (durationMs != null)   pending.setDurationMs(durationMs);
+                if (failedStep != null)   pending.setFailedStep(failedStep);
+                if (failedReason != null) pending.setFailedReason(failedReason);
+                if (commitSha != null && !commitSha.isBlank()) pending.setCommitSha(commitSha);
+                if (isTerminal) bumpTerminalCounter(a, conclusion);
+                a.setLastUpdatedBy(actor);
+                return pending;
+            }
+
             // First sighting → INSERT. Counter +1 for the started run.
             DeployEntry e = DeployEntry.builder().by(actor)
                     .runId(runId).runUrl(runUrl)
