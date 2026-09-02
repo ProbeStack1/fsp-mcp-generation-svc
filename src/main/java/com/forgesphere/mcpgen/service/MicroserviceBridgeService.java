@@ -1655,25 +1655,64 @@ public class MicroserviceBridgeService {
      * projects that haven't got a CICD profile yet. Falls back to "main"
      * when nothing resolves so generation never breaks.
      */
+    /**
+     * Resolve the CONCRETE dev branch this MCP is pushed to and deployed from.
+     * Mirrors fsp-api-development-svc's {@code GitBranchResolver}: the
+     * connector's saved {@code sourceCodeManagement.branch} is authoritative
+     * (that's the branch the pipeline push actually lands on), and a CICD
+     * default-strategy branch is only usable when it's a real name — the
+     * strategy "name" is frequently a branch-protection glob like
+     * {@code feature-*}, which is NOT a branch and must never reach the
+     * generated workflow's push trigger or its deploy {@code if:} guard.
+     */
     public String resolveDevBranch(McpProject p) {
         try {
-            String fromCicd = fetchCicdDevBranch(p.getOnboardingId());
-            if (fromCicd != null && !fromCicd.isBlank()) return fromCicd.trim();
+            String fromConnector = fetchConnectorBranch(p);
+            if (isConcreteBranch(fromConnector)) return fromConnector.trim();
 
-            String connectorId = resolveConnectorId(p);
-            if (connectorId == null) return "main";
-            org.bson.Document conn = bridgeColl(props.getColl().getConnector())
-                    .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
-                    .first();
-            if (conn == null) return "main";
-            org.bson.Document scm = conn.get("sourceCodeManagement", org.bson.Document.class);
-            if (scm == null) return "main";
-            String branch = scm.getString("branch");
-            return (branch == null || branch.isBlank()) ? "main" : branch.trim();
+            String fromCicd = fetchCicdDevBranch(p.getOnboardingId());
+            if (isConcreteBranch(fromCicd)) return fromCicd.trim();
+
+            log.warn("[bridge] resolveDevBranch: no concrete dev branch for project {} "
+                    + "(connector='{}', cicd='{}') — defaulting to 'main'. Save a "
+                    + "source-control branch on the linked connector to fix this.",
+                    p.getId(), fromConnector, fromCicd);
+            return "main";
         } catch (Exception e) {
             log.warn("[bridge] resolveDevBranch failed for project {}: {}", p.getId(), e.getMessage());
             return "main";
         }
+    }
+
+    /** A branch value is usable only if it's non-blank and not a glob pattern. */
+    private static boolean isConcreteBranch(String b) {
+        return b != null && !b.isBlank() && !b.contains("*");
+    }
+
+    /**
+     * The connector's saved {@code sourceCodeManagement.branch}. Resolved by
+     * connector id first, then (like GitBranchResolver) by the project's
+     * organizationId so an org-level connector still counts.
+     */
+    private String fetchConnectorBranch(McpProject p) {
+        org.bson.Document conn = null;
+        String connectorId = resolveConnectorId(p);
+        if (connectorId != null && !connectorId.isBlank()) {
+            conn = bridgeColl(props.getColl().getConnector())
+                    .find(new org.bson.Document("_id", parseIdMaybe(connectorId)))
+                    .first();
+        }
+        if (conn == null) {
+            String orgId = resolveOrganizationId(p);
+            if (orgId != null && !orgId.isBlank()) {
+                conn = bridgeColl(props.getColl().getConnector())
+                        .find(new org.bson.Document("organizationId", orgId))
+                        .first();
+            }
+        }
+        if (conn == null) return null;
+        org.bson.Document scm = conn.get("sourceCodeManagement", org.bson.Document.class);
+        return scm == null ? null : scm.getString("branch");
     }
 
     // ───────────────────────────────────────────────── doc builders
