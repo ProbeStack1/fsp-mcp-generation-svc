@@ -2109,64 +2109,74 @@ public class MicroserviceBridgeService {
      *
      * @return {@code { "jobId": <id>, "steps": [ {number, name, log}, … ] }}
      */
-    public Map<String, Object> getJobStepLogs(McpProject project, String runId, String jobId) {
+    public Map<String, Object> getRunStepLogs(McpProject project, String runId) {
         Map<String, Object> out = new LinkedHashMap<>();
-        out.put("jobId", jobId);
+        out.put("runId", runId);
         out.put("steps", java.util.List.of());
-        if (jobId == null || jobId.isBlank()) return out;
+        if (runId == null || runId.isBlank()) { out.put("error", "runId is required"); return out; }
 
         // 1) Stored failure logs win — GitHub purges Actions logs after ~90d and
         //    the reaper already grabbed the failing job's logs at terminal time.
-        if (project != null && project.getId() != null && runId != null && !runId.isBlank()) {
+        if (project != null && project.getId() != null) {
             try {
-                var stored = stepLogRepo.findByProjectIdAndRunIdAndJobId(project.getId(), runId, jobId).orElse(null);
-                if (stored != null && stored.getSteps() != null && !stored.getSteps().isEmpty()) {
+                var stored = stepLogRepo.findByProjectIdAndRunId(project.getId(), runId);
+                if (stored != null && !stored.isEmpty()) {
                     java.util.List<Map<String, Object>> steps = new java.util.ArrayList<>();
-                    for (var s : stored.getSteps()) {
-                        Map<String, Object> m = new LinkedHashMap<>();
-                        m.put("number", s.getNumber());
-                        m.put("name", s.getName());
-                        m.put("conclusion", s.getConclusion());
-                        m.put("log", s.getLog());
-                        steps.add(m);
+                    for (var doc : stored) {
+                        if (doc.getSteps() == null) continue;
+                        for (var s : doc.getSteps()) {
+                            Map<String, Object> m = new LinkedHashMap<>();
+                            m.put("jobName", doc.getJobName());
+                            m.put("number", s.getNumber());
+                            m.put("name", s.getName());
+                            m.put("conclusion", s.getConclusion());
+                            m.put("log", s.getLog());
+                            steps.add(m);
+                        }
                     }
-                    out.put("steps", steps);
-                    out.put("source", "stored");
-                    return out;
+                    if (!steps.isEmpty()) {
+                        out.put("steps", steps);
+                        out.put("source", "stored");
+                        return out;
+                    }
                 }
             } catch (Exception ignore) { /* fall through to live fetch */ }
         }
 
-        // 2) Live fetch from GitHub.
+        // 2) Live fetch the run's log ZIP from GitHub.
         var creds = resolveGitHubCreds(project);
         if (creds == null) { out.put("error", "No GitHub connector configured"); return out; }
         try {
-            java.util.List<Map<String, Object>> steps = fetchJobStepLogsFromGitHub(creds, jobId, 60_000);
+            java.util.List<Map<String, Object>> steps = fetchRunStepLogsFromGitHub(creds, runId, 60_000);
             out.put("steps", steps);
             out.put("source", "github");
-            if (steps.isEmpty()) out.put("error", "GitHub returned no step logs for this job (run may be too old or still in progress).");
+            if (steps.isEmpty()) {
+                out.put("error", "GitHub returned no step logs for this run (logs expire ~90 days after the run).");
+            }
             return out;
         } catch (Exception ex) {
-            log.warn("[runs] job-log fetch failed for job {}: {}", jobId, ex.getMessage());
+            log.warn("[runs] run-log fetch failed for run {}: {}", runId, ex.getMessage());
             out.put("error", ex.getMessage());
             return out;
         }
     }
 
     /**
-     * Downloads + unzips one job's GitHub Actions log archive into an ordered
-     * list of {@code {number, name, log}} maps. {@code perStepMax} tail-truncates
-     * each step. Throws on transport/zip errors so the caller can surface them.
+     * Downloads + unzips a whole run's GitHub Actions log archive
+     * ({@code GET /actions/runs/{runId}/logs} → 302 → {@code application/zip}
+     * with {@code "<jobFolder>/<n>_<step name>.txt"} entries). Per-JOB logs
+     * ({@code /actions/jobs/{id}/logs}) are plain text, not a zip — this run
+     * endpoint is the only one with per-step files.
+     *
+     * @return ordered list of {@code {jobName, number, name, log}}
      */
-    private java.util.List<Map<String, Object>> fetchJobStepLogsFromGitHub(GhCreds creds, String jobId, int perStepMax)
+    private java.util.List<Map<String, Object>> fetchRunStepLogsFromGitHub(GhCreds creds, String runId, int perStepMax)
             throws Exception {
-        // Step 1: /jobs/{id}/logs → 302 to a short-lived signed URL. Do NOT
-        // follow it with the auth header attached (the storage host 403s it).
         java.net.http.HttpClient apiClient = java.net.http.HttpClient.newBuilder()
                 .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
                 .connectTimeout(java.time.Duration.ofSeconds(10)).build();
         String api = "https://api.github.com/repos/" + creds.orgOrUser + "/" + creds.repo
-                + "/actions/jobs/" + jobId + "/logs";
+                + "/actions/runs/" + runId + "/logs";
         var apiResp = apiClient.send(
                 java.net.http.HttpRequest.newBuilder(java.net.URI.create(api))
                         .timeout(java.time.Duration.ofSeconds(20))
@@ -2181,62 +2191,62 @@ public class MicroserviceBridgeService {
         if (sc / 100 == 3) {
             String loc = apiResp.headers().firstValue("location").orElse(null);
             if (loc == null || loc.isBlank()) throw new IllegalStateException("no redirect location (HTTP " + sc + ")");
-            // Step 2: plain client, follows further redirects, NO auth header.
             java.net.http.HttpClient blobClient = java.net.http.HttpClient.newBuilder()
                     .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
                     .connectTimeout(java.time.Duration.ofSeconds(10)).build();
             var blobResp = blobClient.send(
                     java.net.http.HttpRequest.newBuilder(java.net.URI.create(loc))
-                            .timeout(java.time.Duration.ofSeconds(40)).GET().build(),
+                            .timeout(java.time.Duration.ofSeconds(45)).GET().build(),
                     java.net.http.HttpResponse.BodyHandlers.ofByteArray());
             if (blobResp.statusCode() / 100 != 2) throw new IllegalStateException("log archive HTTP " + blobResp.statusCode());
             zipBytes = blobResp.body();
         } else if (sc / 100 == 2) {
             zipBytes = apiResp.body();
+        } else if (sc == 404) {
+            return java.util.List.of();     // run too old / logs gone
         } else {
-            throw new IllegalStateException("GitHub job-logs HTTP " + sc
-                    + " — " + new String(apiResp.body(), java.nio.charset.StandardCharsets.UTF_8)
-                            .replaceAll("\\s+", " ").substring(0, Math.min(200, apiResp.body().length)));
+            throw new IllegalStateException("GitHub run-logs HTTP " + sc);
         }
-        if (zipBytes == null || zipBytes.length < 4) throw new IllegalStateException("empty log archive");
+        if (zipBytes == null || zipBytes.length < 4) return java.util.List.of();
+        // ZIP local-file-header magic "PK\3\4"; anything else isn't a zip.
+        if (!(zipBytes[0] == 0x50 && zipBytes[1] == 0x4B)) {
+            throw new IllegalStateException("log archive is not a zip (got "
+                    + new String(zipBytes, 0, Math.min(80, zipBytes.length), java.nio.charset.StandardCharsets.UTF_8)
+                            .replaceAll("\\s+", " ") + "…)");
+        }
 
-        java.util.regex.Pattern numbered = java.util.regex.Pattern.compile("^(\\d+)_(.+?)\\.txt$");
+        java.util.regex.Pattern entryPat =
+                java.util.regex.Pattern.compile("^(?:(.+?)/)?(\\d+)_(.+?)\\.txt$");
         java.util.regex.Pattern tsPat =
                 java.util.regex.Pattern.compile("(?m)^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z\\s?");
         java.util.List<Map<String, Object>> steps = new java.util.ArrayList<>();
-        int fallbackIdx = 0;
         try (java.util.zip.ZipInputStream zis =
                      new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(zipBytes))) {
             java.util.zip.ZipEntry e;
             while ((e = zis.getNextEntry()) != null) {
                 if (e.isDirectory()) continue;
-                String name = e.getName();
-                String base = name.substring(name.lastIndexOf('/') + 1);
-                if (!base.toLowerCase().endsWith(".txt")) continue;
+                var m = entryPat.matcher(e.getName());
+                if (!m.matches()) continue;            // skips the top-level 0_<job>.txt summaries
+                String jobName = m.group(1) != null ? m.group(1) : "";
+                int num = Integer.parseInt(m.group(2));
+                String stepName = m.group(3).replace('_', ' ');
                 String text = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
                 text = tsPat.matcher(text).replaceAll("");
                 if (text.length() > perStepMax) {
                     text = "…(truncated " + (text.length() - perStepMax) + " earlier chars)…\n"
                             + text.substring(text.length() - perStepMax);
                 }
-                var m = numbered.matcher(base);
-                Integer num;
-                String stepName;
-                if (m.matches()) {
-                    num = Integer.parseInt(m.group(1));
-                    stepName = m.group(2).replace('_', ' ');
-                } else {
-                    num = ++fallbackIdx;
-                    stepName = base.substring(0, base.length() - 4).replace('_', ' ');
-                }
                 Map<String, Object> step = new LinkedHashMap<>();
+                step.put("jobName", jobName);
                 step.put("number", num);
                 step.put("name", stepName);
                 step.put("log", text);
                 steps.add(step);
             }
         }
-        steps.sort(java.util.Comparator.comparingInt(s -> ((Number) s.get("number")).intValue()));
+        steps.sort(java.util.Comparator
+                .comparing((Map<String, Object> s) -> String.valueOf(s.get("jobName")))
+                .thenComparingInt(s -> ((Number) s.get("number")).intValue()));
         return steps;
     }
 
@@ -2261,6 +2271,20 @@ public class MicroserviceBridgeService {
             java.util.List<Map<String, Object>> jobs =
                     (java.util.List<Map<String, Object>>) jobsWrap.getOrDefault("jobs", java.util.List.of());
 
+            // One ZIP fetch for the whole run, then bucket by job folder name.
+            java.util.List<Map<String, Object>> allSteps;
+            try {
+                allSteps = fetchRunStepLogsFromGitHub(creds, runId, 80_000);
+            } catch (Exception fe) {
+                log.warn("[reaper] run-log fetch for run {}: {}", runId, fe.getMessage());
+                return;
+            }
+            if (allSteps.isEmpty()) return;
+            java.util.Map<String, java.util.List<Map<String, Object>>> byJobName = new java.util.LinkedHashMap<>();
+            for (Map<String, Object> s : allSteps) {
+                byJobName.computeIfAbsent(String.valueOf(s.get("jobName")), k -> new java.util.ArrayList<>()).add(s);
+            }
+
             int remaining = MAX_RUN_BYTES;
             for (Map<String, Object> job : jobs) {
                 String jobConcl = String.valueOf(job.getOrDefault("conclusion", ""));
@@ -2268,33 +2292,31 @@ public class MicroserviceBridgeService {
                 if (remaining <= 0) break;
 
                 String jobId = String.valueOf(job.get("id"));
+                String jobName = String.valueOf(job.getOrDefault("name", ""));
                 @SuppressWarnings("unchecked")
                 java.util.List<Map<String, Object>> jobSteps =
                         (java.util.List<Map<String, Object>>) job.getOrDefault("steps", java.util.List.of());
+                java.util.List<Map<String, Object>> logSteps =
+                        byJobName.getOrDefault(jobName, java.util.List.of());
+                if (logSteps.isEmpty()) continue;
 
-                // Index of the first failing step; keep it + everything after.
-                int firstFail = -1;
-                for (int i = 0; i < jobSteps.size(); i++) {
-                    String sc = String.valueOf(jobSteps.get(i).getOrDefault("conclusion", ""));
-                    if (!sc.isBlank() && !"success".equalsIgnoreCase(sc) && !"skipped".equalsIgnoreCase(sc) && !"null".equals(sc)) {
-                        firstFail = i;
+                // First failing (non success/skipped) step number; keep it onwards.
+                int firstFailNum = Integer.MAX_VALUE;
+                for (Map<String, Object> st : jobSteps) {
+                    String sc = String.valueOf(st.getOrDefault("conclusion", ""));
+                    if (!sc.isBlank() && !"success".equalsIgnoreCase(sc)
+                            && !"skipped".equalsIgnoreCase(sc) && !"null".equals(sc)) {
+                        Object n = st.get("number");
+                        firstFailNum = n instanceof Number nn ? nn.intValue() : 1;
                         break;
                     }
-                }
-
-                java.util.List<Map<String, Object>> logSteps;
-                try {
-                    logSteps = fetchJobStepLogsFromGitHub(creds, jobId, Math.min(remaining, 80_000));
-                } catch (Exception fe) {
-                    log.warn("[reaper] failed-log fetch for job {} run {}: {}", jobId, runId, fe.getMessage());
-                    continue;
                 }
 
                 java.util.List<McpDeployStepLog.StepLog> kept = new java.util.ArrayList<>();
                 int total = 0;
                 for (Map<String, Object> ls : logSteps) {
                     int lsNum = ((Number) ls.getOrDefault("number", 0)).intValue();
-                    if (firstFail >= 0 && lsNum < (firstFail + 1)) continue; // GH step numbers are 1-based
+                    if (lsNum < firstFailNum) continue;
                     String logText = String.valueOf(ls.getOrDefault("log", ""));
                     if (total + logText.length() > remaining) {
                         int room = Math.max(0, remaining - total);
@@ -2302,14 +2324,10 @@ public class MicroserviceBridgeService {
                                 : "…(truncated)…\n" + logText.substring(Math.max(0, logText.length() - room));
                     }
                     total += logText.length();
-                    String stepConcl = null;
-                    if (firstFail >= 0 && (lsNum - 1) < jobSteps.size() && (lsNum - 1) >= 0) {
-                        stepConcl = String.valueOf(jobSteps.get(lsNum - 1).getOrDefault("conclusion", ""));
-                    }
                     kept.add(McpDeployStepLog.StepLog.builder()
                             .number(lsNum)
                             .name(String.valueOf(ls.getOrDefault("name", "step " + lsNum)))
-                            .conclusion(stepConcl)
+                            .conclusion(stepConclusion(jobSteps, lsNum))
                             .log(logText)
                             .build());
                     if (total >= remaining) break;
@@ -2321,19 +2339,29 @@ public class MicroserviceBridgeService {
                         .projectId(project.getId())
                         .runId(runId)
                         .jobId(jobId)
-                        .jobName(String.valueOf(job.getOrDefault("name", "job")))
+                        .jobName(jobName)
                         .conclusion(jobConcl)
                         .steps(kept)
                         .totalBytes(total)
-                        .truncated(total >= Math.min(MAX_RUN_BYTES, 80_000))
+                        .truncated(total >= 80_000)
                         .createdAt(Instant.now())
                         .build());
                 log.info("[reaper] stored {} failed-step log(s) for run {} job {} ({} bytes)",
-                        kept.size(), runId, jobId, total);
+                        kept.size(), runId, jobName, total);
             }
         } catch (Exception ex) {
             log.warn("[reaper] persistFailedDeployLogs run {} failed: {}", runId, ex.getMessage());
         }
+    }
+
+    private static String stepConclusion(java.util.List<Map<String, Object>> jobSteps, int number) {
+        for (Map<String, Object> st : jobSteps) {
+            Object n = st.get("number");
+            if (n instanceof Number nn && nn.intValue() == number) {
+                return String.valueOf(st.getOrDefault("conclusion", ""));
+            }
+        }
+        return null;
     }
 
     // Internal connector-credential record returned by resolveGitHubCreds.

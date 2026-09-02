@@ -595,13 +595,16 @@ public class McpProjectController {
         return Envelope.ok(bridgeSvc.getWorkflowRunSteps(p, runId));
     }
 
-    /** Per-step log text for one job of a run (unzipped from GitHub's job-logs archive). */
-    @GetMapping("/{id}/workflow-runs/{runId}/jobs/{jobId}/logs")
-    public Envelope<Map<String, Object>> jobStepLogs(@PathVariable String id,
-                                                     @PathVariable String runId,
-                                                     @PathVariable String jobId) {
+    /**
+     * Per-step GitHub Actions log text for a whole run — {@code {steps:[{jobName,
+     * number, name, log}]}}. Stored failure logs first, else GitHub's run-logs
+     * ZIP unzipped live. The UI buckets steps by {@code jobName}.
+     */
+    @GetMapping("/{id}/workflow-runs/{runId}/step-logs")
+    public Envelope<Map<String, Object>> runStepLogs(@PathVariable String id,
+                                                     @PathVariable String runId) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
-        return Envelope.ok(bridgeSvc.getJobStepLogs(p, runId, jobId));
+        return Envelope.ok(bridgeSvc.getRunStepLogs(p, runId));
     }
 
     // ------------- Client configs -------------
