@@ -251,13 +251,28 @@ public class MicroserviceBridgeService {
         final int fileCount = mcp.getGenerated().getFiles().size();
 
         // 2) Reuse mirror ids if we've published this project before so
-        //    revision pushes target the SAME microservice row.
-        String microserviceId   = mcp.getMicroserviceMirrorId() != null
-                ? mcp.getMicroserviceMirrorId() : new ObjectId().toHexString();
-        String artifactId       = mcp.getDeploymentArtifactId() != null
-                ? mcp.getDeploymentArtifactId() : new ObjectId().toHexString();
-        String codeGenResultId  = mcp.getCodeGenResultId() != null
-                ? mcp.getCodeGenResultId() : new ObjectId().toHexString();
+        //    revision pushes target the SAME rows. The in-memory McpProject
+        //    can lose these (the generator returns a fresh instance, and
+        //    `generated` is @Transient so mirror() re-runs the generator on
+        //    a second call) — so when they're missing we RECOVER them from
+        //    the already-written mirror docs (keyed by mcpProjectId) before
+        //    minting fresh ObjectIds. Without this a second deploy call
+        //    writes a *duplicate* codegen_results / microservice / artifact
+        //    row, and fsp-api-development-svc's findByMicroserviceId(...)
+        //    then blows up with IncorrectResultSizeDataAccessException
+        //    ("Multiple records found …").
+        String microserviceId = firstNonBlank(
+                mcp.getMicroserviceMirrorId(),
+                lookupMirrorId(props.getColl().getMicroservice(), mcp.getId()));
+        String artifactId = firstNonBlank(
+                mcp.getDeploymentArtifactId(),
+                lookupMirrorId(props.getColl().getDeploymentArtifacts(), mcp.getId()));
+        String codeGenResultId = firstNonBlank(
+                mcp.getCodeGenResultId(),
+                lookupMirrorId(props.getColl().getCodegenResults(), mcp.getId()));
+        if (microserviceId == null)  microserviceId  = new ObjectId().toHexString();
+        if (artifactId == null)      artifactId      = new ObjectId().toHexString();
+        if (codeGenResultId == null) codeGenResultId = new ObjectId().toHexString();
         // Fresh generationId + UUID on every push so the GCS key never collides.
         String generationId = UUID.randomUUID().toString();
         String fileUuid     = UUID.randomUUID().toString();
@@ -303,6 +318,16 @@ public class MicroserviceBridgeService {
                 null, artifact.url(), archiveFileName, zipBytes.length, fileUuid);
         upsertMicroserviceDoc(mcp, microserviceId, codeGenResultId);
         upsertDeploymentArtifact(mcp, microserviceId, artifactId);
+
+        // 4b) Self-heal: an earlier non-idempotent run may have left DUPLICATE
+        //     rows for this project (same mcpProjectId, different _id). That's
+        //     what makes fsp-api-development-svc's findByMicroserviceId(..)
+        //     throw "Multiple records found …". Drop every row for this
+        //     project except the canonical one we just upserted. Scoped by
+        //     mcpProjectId so it can only ever touch MCP-mirrored rows.
+        pruneDuplicateMirrorDocs(props.getColl().getCodegenResults(), codeGenResultId, mcp.getId());
+        pruneDuplicateMirrorDocs(props.getColl().getMicroservice(), microserviceId, mcp.getId());
+        pruneDuplicateMirrorDocs(props.getColl().getDeploymentArtifacts(), artifactId, mcp.getId());
 
         // 5) Persist mirror state on our doc for idempotency. We keep the real
         //    gcsArchivePath HERE (our own field) even though the mirror doc
@@ -411,6 +436,56 @@ public class MicroserviceBridgeService {
         return null;
     }
 
+    /**
+     * Recover a previously-written mirror doc's {@code _id} for this MCP
+     * project (keyed by {@code mcpProjectId}). Returns the newest match as
+     * a hex string, or null when none exists. If more than one is found the
+     * data is already duplicated — we log it and reuse the newest so at
+     * least this run doesn't add a third.
+     */
+    /**
+     * Delete every doc in {@code collection} for this MCP project
+     * ({@code mcpProjectId}) whose {@code _id} is not {@code keepId} — i.e.
+     * leftovers from a pre-idempotency run. Best-effort; a failure here
+     * never fails the deploy.
+     */
+    private void pruneDuplicateMirrorDocs(String collection, String keepId, String mcpProjectId) {
+        if (mcpProjectId == null || mcpProjectId.isBlank() || keepId == null) return;
+        try {
+            org.bson.Document filter = new org.bson.Document("mcpProjectId", mcpProjectId)
+                    .append("_id", new org.bson.Document("$ne", parseIdMaybe(keepId)));
+            long removed = bridgeColl(collection).deleteMany(filter).getDeletedCount();
+            if (removed > 0) {
+                log.warn("[bridge] pruned {} stale {} row(s) for mcpProjectId={} (kept _id={})",
+                        removed, collection, mcpProjectId, keepId);
+            }
+        } catch (Exception e) {
+            log.warn("[bridge] pruneDuplicateMirrorDocs({}, {}) failed: {}", collection, mcpProjectId, e.getMessage());
+        }
+    }
+
+    private String lookupMirrorId(String collection, String mcpProjectId) {
+        if (mcpProjectId == null || mcpProjectId.isBlank()) return null;
+        try {
+            java.util.List<org.bson.Document> hits = new java.util.ArrayList<>();
+            bridgeColl(collection)
+                    .find(new org.bson.Document("mcpProjectId", mcpProjectId))
+                    .sort(new org.bson.Document("_id", -1))
+                    .limit(5)
+                    .into(hits);
+            if (hits.isEmpty()) return null;
+            if (hits.size() > 1) {
+                log.warn("[bridge] {} has {} rows for mcpProjectId={} — reusing newest _id; older rows are stale",
+                        collection, hits.size(), mcpProjectId);
+            }
+            Object id = hits.get(0).get("_id");
+            return id == null ? null : id.toString();
+        } catch (Exception e) {
+            log.warn("[bridge] lookupMirrorId({}, {}) failed: {}", collection, mcpProjectId, e.getMessage());
+            return null;
+        }
+    }
+
     public boolean isPipelineDeployEnabled() {
         return pipelineDeployEnabled;
     }
@@ -434,7 +509,24 @@ public class MicroserviceBridgeService {
      * after a successful push.
      */
     public Map<String, Object> deployViaPipeline(McpProject project, String actorEmail) {
-        Map<String, Object> mirrorOut = mirror(project);
+        // The wizard usually calls POST /deploy-to-github (which runs mirror())
+        // and then POST /push-to-github (this) back-to-back. Re-running mirror()
+        // here would re-upload the bundle and rewrite every mirror doc for no
+        // reason — and any hiccup in the id-reuse path risks a duplicate row.
+        // If the project was mirrored moments ago, reuse it; otherwise mirror.
+        Map<String, Object> mirrorOut;
+        boolean freshMirror = project.getMicroserviceMirrorId() != null
+                && !project.getMicroserviceMirrorId().isBlank()
+                && project.getMirroredAt() != null
+                && project.getMirroredAt().isAfter(Instant.now().minusSeconds(600));
+        if (freshMirror) {
+            log.info("[pipeline] reusing mirror from {} for project={}", project.getMirroredAt(), project.getId());
+            mirrorOut = new LinkedHashMap<>();
+            mirrorOut.put("microserviceId", project.getMicroserviceMirrorId());
+            mirrorOut.put("repositoryName", project.getRepositoryName());
+        } else {
+            mirrorOut = mirror(project);
+        }
         String microserviceId = String.valueOf(mirrorOut.get("microserviceId"));
 
         String url = apiDevelopmentServiceUrl.replaceAll("/+$", "")
