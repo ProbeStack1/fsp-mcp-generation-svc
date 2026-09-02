@@ -2209,41 +2209,68 @@ public class MicroserviceBridgeService {
             throw new IllegalStateException("GitHub run-logs HTTP " + sc);
         }
         if (zipBytes == null || zipBytes.length < 4) return java.util.List.of();
-        // ZIP local-file-header magic "PK\3\4"; anything else isn't a zip.
-        if (!(zipBytes[0] == 0x50 && zipBytes[1] == 0x4B)) {
+        if (!(zipBytes[0] == 0x50 && zipBytes[1] == 0x4B)) {   // "PK" — not a zip
             throw new IllegalStateException("log archive is not a zip (got "
                     + new String(zipBytes, 0, Math.min(80, zipBytes.length), java.nio.charset.StandardCharsets.UTF_8)
                             .replaceAll("\\s+", " ") + "…)");
         }
 
-        java.util.regex.Pattern entryPat =
-                java.util.regex.Pattern.compile("^(?:(.+?)/)?(\\d+)_(.+?)\\.txt$");
+        // Read via ZipFile (central directory) — ZipInputStream silently stops
+        // on GitHub's streamed zips and misses the per-step folder entries.
+        java.io.File tmp = java.io.File.createTempFile("gh-run-log-", ".zip");
+        java.util.regex.Pattern perStep =    // "<jobFolder>/<n>_<step>.txt"
+                java.util.regex.Pattern.compile("^(.+?)/(\\d+)_(.+?)\\.txt$");
+        java.util.regex.Pattern perJob =     // root "<n>_<jobName>.txt" (whole-job log)
+                java.util.regex.Pattern.compile("^(\\d+)_(.+?)\\.txt$");
         java.util.regex.Pattern tsPat =
                 java.util.regex.Pattern.compile("(?m)^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z\\s?");
         java.util.List<Map<String, Object>> steps = new java.util.ArrayList<>();
-        try (java.util.zip.ZipInputStream zis =
-                     new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(zipBytes))) {
-            java.util.zip.ZipEntry e;
-            while ((e = zis.getNextEntry()) != null) {
-                if (e.isDirectory()) continue;
-                var m = entryPat.matcher(e.getName());
-                if (!m.matches()) continue;            // skips the top-level 0_<job>.txt summaries
-                String jobName = m.group(1) != null ? m.group(1) : "";
-                int num = Integer.parseInt(m.group(2));
-                String stepName = m.group(3).replace('_', ' ');
-                String text = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                text = tsPat.matcher(text).replaceAll("");
-                if (text.length() > perStepMax) {
-                    text = "…(truncated " + (text.length() - perStepMax) + " earlier chars)…\n"
-                            + text.substring(text.length() - perStepMax);
+        java.util.List<Map<String, Object>> jobFallback = new java.util.ArrayList<>();
+        java.util.Set<String> jobsWithSteps = new java.util.HashSet<>();
+        try {
+            java.nio.file.Files.write(tmp.toPath(), zipBytes);
+            try (java.util.zip.ZipFile zf = new java.util.zip.ZipFile(tmp)) {
+                var entries = zf.entries();
+                while (entries.hasMoreElements()) {
+                    java.util.zip.ZipEntry e = entries.nextElement();
+                    if (e.isDirectory()) continue;
+                    String name = e.getName();
+                    var ms = perStep.matcher(name);
+                    var mj = perJob.matcher(name);
+                    String jobName; int num; String label; boolean whole;
+                    if (ms.matches()) {
+                        jobName = ms.group(1); num = Integer.parseInt(ms.group(2));
+                        label = ms.group(3).replace('_', ' '); whole = false;
+                    } else if (mj.matches()) {
+                        jobName = mj.group(2).replace('_', ' '); num = 0;
+                        label = "Full job log"; whole = true;
+                    } else {
+                        continue;
+                    }
+                    String text;
+                    try (java.io.InputStream is = zf.getInputStream(e)) {
+                        text = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                    }
+                    text = tsPat.matcher(text).replaceAll("");
+                    if (text.length() > perStepMax) {
+                        text = "…(truncated " + (text.length() - perStepMax) + " earlier chars)…\n"
+                                + text.substring(text.length() - perStepMax);
+                    }
+                    Map<String, Object> row = new LinkedHashMap<>();
+                    row.put("jobName", jobName);
+                    row.put("number", num);
+                    row.put("name", label);
+                    row.put("log", text);
+                    if (whole) jobFallback.add(row);
+                    else { steps.add(row); jobsWithSteps.add(jobName); }
                 }
-                Map<String, Object> step = new LinkedHashMap<>();
-                step.put("jobName", jobName);
-                step.put("number", num);
-                step.put("name", stepName);
-                step.put("log", text);
-                steps.add(step);
             }
+        } finally {
+            try { java.nio.file.Files.deleteIfExists(tmp.toPath()); } catch (Exception ignore) { /* temp */ }
+        }
+        // Only include a whole-job log when that job had NO per-step files.
+        for (Map<String, Object> jf : jobFallback) {
+            if (!jobsWithSteps.contains(String.valueOf(jf.get("jobName")))) steps.add(jf);
         }
         steps.sort(java.util.Comparator
                 .comparing((Map<String, Object> s) -> String.valueOf(s.get("jobName")))
