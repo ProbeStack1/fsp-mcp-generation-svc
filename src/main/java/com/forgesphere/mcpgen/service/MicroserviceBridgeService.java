@@ -3,6 +3,8 @@ package com.forgesphere.mcpgen.service;
 import com.forgesphere.mcpgen.bridge.BridgeGcsClient;
 import com.forgesphere.mcpgen.bridge.BridgeProperties;
 import com.forgesphere.mcpgen.model.McpProject;
+import com.forgesphere.mcpgen.model.McpDeployStepLog;
+import com.forgesphere.mcpgen.repo.McpDeployStepLogRepository;
 import com.forgesphere.mcpgen.repo.McpProjectRepository;
 import com.mongodb.client.MongoCollection;
 import lombok.RequiredArgsConstructor;
@@ -95,6 +97,7 @@ public class MicroserviceBridgeService {
 
     private final MongoTemplate mongo;
     private final McpProjectRepository projects;
+    private final McpDeployStepLogRepository stepLogRepo;
     private final McpGenerationService genSvc;
     private final BridgeGcsClient gcs;
     private final BridgeProperties props;
@@ -2106,81 +2109,230 @@ public class MicroserviceBridgeService {
      *
      * @return {@code { "jobId": <id>, "steps": [ {number, name, log}, … ] }}
      */
-    public Map<String, Object> getJobStepLogs(McpProject project, String jobId) {
+    public Map<String, Object> getJobStepLogs(McpProject project, String runId, String jobId) {
         Map<String, Object> out = new LinkedHashMap<>();
         out.put("jobId", jobId);
         out.put("steps", java.util.List.of());
         if (jobId == null || jobId.isBlank()) return out;
 
+        // 1) Stored failure logs win — GitHub purges Actions logs after ~90d and
+        //    the reaper already grabbed the failing job's logs at terminal time.
+        if (project != null && project.getId() != null && runId != null && !runId.isBlank()) {
+            try {
+                var stored = stepLogRepo.findByProjectIdAndRunIdAndJobId(project.getId(), runId, jobId).orElse(null);
+                if (stored != null && stored.getSteps() != null && !stored.getSteps().isEmpty()) {
+                    java.util.List<Map<String, Object>> steps = new java.util.ArrayList<>();
+                    for (var s : stored.getSteps()) {
+                        Map<String, Object> m = new LinkedHashMap<>();
+                        m.put("number", s.getNumber());
+                        m.put("name", s.getName());
+                        m.put("conclusion", s.getConclusion());
+                        m.put("log", s.getLog());
+                        steps.add(m);
+                    }
+                    out.put("steps", steps);
+                    out.put("source", "stored");
+                    return out;
+                }
+            } catch (Exception ignore) { /* fall through to live fetch */ }
+        }
+
+        // 2) Live fetch from GitHub.
         var creds = resolveGitHubCreds(project);
         if (creds == null) { out.put("error", "No GitHub connector configured"); return out; }
-
         try {
-            java.net.http.HttpClient noRedirect = java.net.http.HttpClient.newBuilder()
-                    .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
-                    .connectTimeout(java.time.Duration.ofSeconds(10))
-                    .build();
-            String api = "https://api.github.com/repos/" + creds.orgOrUser + "/" + creds.repo
-                    + "/actions/jobs/" + jobId + "/logs";
-            var apiReq = java.net.http.HttpRequest.newBuilder(java.net.URI.create(api))
-                    .timeout(java.time.Duration.ofSeconds(20))
-                    .header("Authorization", "Bearer " + creds.token)
-                    .header("Accept", "application/vnd.github+json")
-                    .GET().build();
-            var apiResp = noRedirect.send(apiReq, java.net.http.HttpResponse.BodyHandlers.ofByteArray());
-
-            byte[] zipBytes;
-            int sc = apiResp.statusCode();
-            if (sc == 301 || sc == 302 || sc == 307 || sc == 308) {
-                String loc = apiResp.headers().firstValue("location").orElse(null);
-                if (loc == null || loc.isBlank()) { out.put("error", "No redirect location for job logs"); return out; }
-                var blobResp = java.net.http.HttpClient.newHttpClient().send(
-                        java.net.http.HttpRequest.newBuilder(java.net.URI.create(loc))
-                                .timeout(java.time.Duration.ofSeconds(30)).GET().build(),
-                        java.net.http.HttpResponse.BodyHandlers.ofByteArray());
-                if (blobResp.statusCode() / 100 != 2) { out.put("error", "Log archive fetch failed: " + blobResp.statusCode()); return out; }
-                zipBytes = blobResp.body();
-            } else if (sc / 100 == 2) {
-                zipBytes = apiResp.body();
-            } else {
-                out.put("error", "GitHub job-logs failed: " + sc);
-                return out;
-            }
-
-            java.util.regex.Pattern entryPat = java.util.regex.Pattern.compile("^(\\d+)_(.+?)\\.txt$");
-            java.util.regex.Pattern tsPat =
-                    java.util.regex.Pattern.compile("(?m)^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z\\s?");
-            java.util.Map<Integer, Map<String, Object>> byNumber = new java.util.TreeMap<>();
-            try (java.util.zip.ZipInputStream zis =
-                         new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(zipBytes))) {
-                java.util.zip.ZipEntry e;
-                while ((e = zis.getNextEntry()) != null) {
-                    if (e.isDirectory()) continue;
-                    String base = e.getName().substring(e.getName().lastIndexOf('/') + 1);
-                    var m = entryPat.matcher(base);
-                    if (!m.matches()) continue;
-                    int num = Integer.parseInt(m.group(1));
-                    String stepName = m.group(2).replace('_', ' ');
-                    String text = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
-                    text = tsPat.matcher(text).replaceAll("");
-                    final int MAX = 60_000;
-                    if (text.length() > MAX) {
-                        text = "…(truncated " + (text.length() - MAX) + " earlier chars)…\n"
-                                + text.substring(text.length() - MAX);
-                    }
-                    Map<String, Object> step = new LinkedHashMap<>();
-                    step.put("number", num);
-                    step.put("name", stepName);
-                    step.put("log", text);
-                    byNumber.put(num, step);
-                }
-            }
-            out.put("steps", new java.util.ArrayList<>(byNumber.values()));
+            java.util.List<Map<String, Object>> steps = fetchJobStepLogsFromGitHub(creds, jobId, 60_000);
+            out.put("steps", steps);
+            out.put("source", "github");
+            if (steps.isEmpty()) out.put("error", "GitHub returned no step logs for this job (run may be too old or still in progress).");
             return out;
         } catch (Exception ex) {
             log.warn("[runs] job-log fetch failed for job {}: {}", jobId, ex.getMessage());
             out.put("error", ex.getMessage());
             return out;
+        }
+    }
+
+    /**
+     * Downloads + unzips one job's GitHub Actions log archive into an ordered
+     * list of {@code {number, name, log}} maps. {@code perStepMax} tail-truncates
+     * each step. Throws on transport/zip errors so the caller can surface them.
+     */
+    private java.util.List<Map<String, Object>> fetchJobStepLogsFromGitHub(GhCreds creds, String jobId, int perStepMax)
+            throws Exception {
+        // Step 1: /jobs/{id}/logs → 302 to a short-lived signed URL. Do NOT
+        // follow it with the auth header attached (the storage host 403s it).
+        java.net.http.HttpClient apiClient = java.net.http.HttpClient.newBuilder()
+                .followRedirects(java.net.http.HttpClient.Redirect.NEVER)
+                .connectTimeout(java.time.Duration.ofSeconds(10)).build();
+        String api = "https://api.github.com/repos/" + creds.orgOrUser + "/" + creds.repo
+                + "/actions/jobs/" + jobId + "/logs";
+        var apiResp = apiClient.send(
+                java.net.http.HttpRequest.newBuilder(java.net.URI.create(api))
+                        .timeout(java.time.Duration.ofSeconds(20))
+                        .header("Authorization", "Bearer " + creds.token)
+                        .header("Accept", "application/vnd.github+json")
+                        .header("X-GitHub-Api-Version", "2022-11-28")
+                        .GET().build(),
+                java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+
+        byte[] zipBytes;
+        int sc = apiResp.statusCode();
+        if (sc / 100 == 3) {
+            String loc = apiResp.headers().firstValue("location").orElse(null);
+            if (loc == null || loc.isBlank()) throw new IllegalStateException("no redirect location (HTTP " + sc + ")");
+            // Step 2: plain client, follows further redirects, NO auth header.
+            java.net.http.HttpClient blobClient = java.net.http.HttpClient.newBuilder()
+                    .followRedirects(java.net.http.HttpClient.Redirect.NORMAL)
+                    .connectTimeout(java.time.Duration.ofSeconds(10)).build();
+            var blobResp = blobClient.send(
+                    java.net.http.HttpRequest.newBuilder(java.net.URI.create(loc))
+                            .timeout(java.time.Duration.ofSeconds(40)).GET().build(),
+                    java.net.http.HttpResponse.BodyHandlers.ofByteArray());
+            if (blobResp.statusCode() / 100 != 2) throw new IllegalStateException("log archive HTTP " + blobResp.statusCode());
+            zipBytes = blobResp.body();
+        } else if (sc / 100 == 2) {
+            zipBytes = apiResp.body();
+        } else {
+            throw new IllegalStateException("GitHub job-logs HTTP " + sc
+                    + " — " + new String(apiResp.body(), java.nio.charset.StandardCharsets.UTF_8)
+                            .replaceAll("\\s+", " ").substring(0, Math.min(200, apiResp.body().length)));
+        }
+        if (zipBytes == null || zipBytes.length < 4) throw new IllegalStateException("empty log archive");
+
+        java.util.regex.Pattern numbered = java.util.regex.Pattern.compile("^(\\d+)_(.+?)\\.txt$");
+        java.util.regex.Pattern tsPat =
+                java.util.regex.Pattern.compile("(?m)^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d+Z\\s?");
+        java.util.List<Map<String, Object>> steps = new java.util.ArrayList<>();
+        int fallbackIdx = 0;
+        try (java.util.zip.ZipInputStream zis =
+                     new java.util.zip.ZipInputStream(new java.io.ByteArrayInputStream(zipBytes))) {
+            java.util.zip.ZipEntry e;
+            while ((e = zis.getNextEntry()) != null) {
+                if (e.isDirectory()) continue;
+                String name = e.getName();
+                String base = name.substring(name.lastIndexOf('/') + 1);
+                if (!base.toLowerCase().endsWith(".txt")) continue;
+                String text = new String(zis.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
+                text = tsPat.matcher(text).replaceAll("");
+                if (text.length() > perStepMax) {
+                    text = "…(truncated " + (text.length() - perStepMax) + " earlier chars)…\n"
+                            + text.substring(text.length() - perStepMax);
+                }
+                var m = numbered.matcher(base);
+                Integer num;
+                String stepName;
+                if (m.matches()) {
+                    num = Integer.parseInt(m.group(1));
+                    stepName = m.group(2).replace('_', ' ');
+                } else {
+                    num = ++fallbackIdx;
+                    stepName = base.substring(0, base.length() - 4).replace('_', ' ');
+                }
+                Map<String, Object> step = new LinkedHashMap<>();
+                step.put("number", num);
+                step.put("name", stepName);
+                step.put("log", text);
+                steps.add(step);
+            }
+        }
+        steps.sort(java.util.Comparator.comparingInt(s -> ((Number) s.get("number")).intValue()));
+        return steps;
+    }
+
+    /**
+     * Persist the FAILING job(s)' step logs for a deploy run so they survive
+     * GitHub's ~90-day log retention. Called by the reaper the instant it sees
+     * a non-{@code success} terminal conclusion. Idempotent by {@code runId}.
+     *
+     * <p>Bounded: only the first failing step and everything after it is kept
+     * per job, and the whole run is capped at {@code MAX_RUN_BYTES} (~500 KB).</p>
+     */
+    public void persistFailedDeployLogs(McpProject project, String runId) {
+        if (project == null || project.getId() == null || runId == null || runId.isBlank()) return;
+        final int MAX_RUN_BYTES = 500_000;
+        try {
+            if (stepLogRepo.existsByProjectIdAndRunId(project.getId(), runId)) return;
+            var creds = resolveGitHubCreds(project);
+            if (creds == null) return;
+
+            Map<String, Object> jobsWrap = getWorkflowRunSteps(project, runId);
+            @SuppressWarnings("unchecked")
+            java.util.List<Map<String, Object>> jobs =
+                    (java.util.List<Map<String, Object>>) jobsWrap.getOrDefault("jobs", java.util.List.of());
+
+            int remaining = MAX_RUN_BYTES;
+            for (Map<String, Object> job : jobs) {
+                String jobConcl = String.valueOf(job.getOrDefault("conclusion", ""));
+                if ("success".equalsIgnoreCase(jobConcl) || jobConcl.isBlank() || "null".equals(jobConcl)) continue;
+                if (remaining <= 0) break;
+
+                String jobId = String.valueOf(job.get("id"));
+                @SuppressWarnings("unchecked")
+                java.util.List<Map<String, Object>> jobSteps =
+                        (java.util.List<Map<String, Object>>) job.getOrDefault("steps", java.util.List.of());
+
+                // Index of the first failing step; keep it + everything after.
+                int firstFail = -1;
+                for (int i = 0; i < jobSteps.size(); i++) {
+                    String sc = String.valueOf(jobSteps.get(i).getOrDefault("conclusion", ""));
+                    if (!sc.isBlank() && !"success".equalsIgnoreCase(sc) && !"skipped".equalsIgnoreCase(sc) && !"null".equals(sc)) {
+                        firstFail = i;
+                        break;
+                    }
+                }
+
+                java.util.List<Map<String, Object>> logSteps;
+                try {
+                    logSteps = fetchJobStepLogsFromGitHub(creds, jobId, Math.min(remaining, 80_000));
+                } catch (Exception fe) {
+                    log.warn("[reaper] failed-log fetch for job {} run {}: {}", jobId, runId, fe.getMessage());
+                    continue;
+                }
+
+                java.util.List<McpDeployStepLog.StepLog> kept = new java.util.ArrayList<>();
+                int total = 0;
+                for (Map<String, Object> ls : logSteps) {
+                    int lsNum = ((Number) ls.getOrDefault("number", 0)).intValue();
+                    if (firstFail >= 0 && lsNum < (firstFail + 1)) continue; // GH step numbers are 1-based
+                    String logText = String.valueOf(ls.getOrDefault("log", ""));
+                    if (total + logText.length() > remaining) {
+                        int room = Math.max(0, remaining - total);
+                        logText = room == 0 ? "…(omitted — run byte budget reached)…"
+                                : "…(truncated)…\n" + logText.substring(Math.max(0, logText.length() - room));
+                    }
+                    total += logText.length();
+                    String stepConcl = null;
+                    if (firstFail >= 0 && (lsNum - 1) < jobSteps.size() && (lsNum - 1) >= 0) {
+                        stepConcl = String.valueOf(jobSteps.get(lsNum - 1).getOrDefault("conclusion", ""));
+                    }
+                    kept.add(McpDeployStepLog.StepLog.builder()
+                            .number(lsNum)
+                            .name(String.valueOf(ls.getOrDefault("name", "step " + lsNum)))
+                            .conclusion(stepConcl)
+                            .log(logText)
+                            .build());
+                    if (total >= remaining) break;
+                }
+                if (kept.isEmpty()) continue;
+                remaining -= total;
+
+                stepLogRepo.save(McpDeployStepLog.builder()
+                        .projectId(project.getId())
+                        .runId(runId)
+                        .jobId(jobId)
+                        .jobName(String.valueOf(job.getOrDefault("name", "job")))
+                        .conclusion(jobConcl)
+                        .steps(kept)
+                        .totalBytes(total)
+                        .truncated(total >= Math.min(MAX_RUN_BYTES, 80_000))
+                        .createdAt(Instant.now())
+                        .build());
+                log.info("[reaper] stored {} failed-step log(s) for run {} job {} ({} bytes)",
+                        kept.size(), runId, jobId, total);
+            }
+        } catch (Exception ex) {
+            log.warn("[reaper] persistFailedDeployLogs run {} failed: {}", runId, ex.getMessage());
         }
     }
 

@@ -217,6 +217,15 @@ public class DeployStatusReaper {
         boolean terminalTransition = trailAfter.getTotalDeploysSuccess() > beforeSuccess
                 || trailAfter.getTotalDeploysFailed() > beforeFailed;
         boolean changed = appended || terminalTransition;
+
+        // On a FAILED terminal transition, grab + store the failing job's step
+        // logs now — GitHub purges Actions logs after ~90 days and this is the
+        // "why did it break" record we want kept. Best-effort, idempotent.
+        boolean failedTerminal = trailAfter.getTotalDeploysFailed() > beforeFailed;
+        if (failedTerminal) {
+            try { bridge.persistFailedDeployLogs(p, runId); }
+            catch (Exception ex) { log.warn("[reaper] persistFailedDeployLogs {} failed: {}", p.getId(), ex.getMessage()); }
+        }
         if (changed) {
             log.debug("[reaper] {} {} runId={} status={} conclusion={}",
                     p.getId(),

@@ -601,7 +601,7 @@ public class McpProjectController {
                                                      @PathVariable String runId,
                                                      @PathVariable String jobId) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
-        return Envelope.ok(bridgeSvc.getJobStepLogs(p, jobId));
+        return Envelope.ok(bridgeSvc.getJobStepLogs(p, runId, jobId));
     }
 
     // ------------- Client configs -------------
