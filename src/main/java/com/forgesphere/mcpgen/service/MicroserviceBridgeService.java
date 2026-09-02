@@ -261,18 +261,28 @@ public class MicroserviceBridgeService {
         //    row, and fsp-api-development-svc's findByMicroserviceId(...)
         //    then blows up with IncorrectResultSizeDataAccessException
         //    ("Multiple records found …").
+        // Resolution order per mirror doc: (1) id already persisted on the
+        // project, (2) id recovered from an existing mirror row by mcpProjectId,
+        // (3) a DETERMINISTIC id derived from the project id. Step 3 replaces the
+        // old "mint a random ObjectId" fallback — two mirror() calls that race
+        // (the wizard fires it from more than one step) used to each mint their
+        // own random id and both upsert, producing two codegen_results rows with
+        // the same microserviceId, which then makes fsp-api-development-svc's
+        // findByMicroserviceId(..).orElse* blow up with "Multiple records found".
+        // A stable seed makes concurrent calls converge on ONE _id so the
+        // replaceOne(upsert) is naturally idempotent.
         String microserviceId = firstNonBlank(
                 mcp.getMicroserviceMirrorId(),
-                lookupMirrorId(props.getColl().getMicroservice(), mcp.getId()));
+                lookupMirrorId(props.getColl().getMicroservice(), mcp.getId()),
+                stableObjectId(mcp.getId() + "|microservice"));
         String artifactId = firstNonBlank(
                 mcp.getDeploymentArtifactId(),
-                lookupMirrorId(props.getColl().getDeploymentArtifacts(), mcp.getId()));
+                lookupMirrorId(props.getColl().getDeploymentArtifacts(), mcp.getId()),
+                stableObjectId(mcp.getId() + "|artifact"));
         String codeGenResultId = firstNonBlank(
                 mcp.getCodeGenResultId(),
-                lookupMirrorId(props.getColl().getCodegenResults(), mcp.getId()));
-        if (microserviceId == null)  microserviceId  = new ObjectId().toHexString();
-        if (artifactId == null)      artifactId      = new ObjectId().toHexString();
-        if (codeGenResultId == null) codeGenResultId = new ObjectId().toHexString();
+                lookupMirrorId(props.getColl().getCodegenResults(), mcp.getId()),
+                stableObjectId(mcp.getId() + "|codegen"));
         // Fresh generationId + UUID on every push so the GCS key never collides.
         String generationId = UUID.randomUUID().toString();
         String fileUuid     = UUID.randomUUID().toString();
@@ -326,9 +336,9 @@ public class MicroserviceBridgeService {
         //     throw "Multiple records found …". Drop every row for this
         //     project except the canonical one we just upserted. Scoped by
         //     mcpProjectId so it can only ever touch MCP-mirrored rows.
-        pruneDuplicateMirrorDocs(props.getColl().getCodegenResults(), codeGenResultId, mcp.getId());
-        pruneDuplicateMirrorDocs(props.getColl().getMicroservice(), microserviceId, mcp.getId());
-        pruneDuplicateMirrorDocs(props.getColl().getDeploymentArtifacts(), artifactId, mcp.getId());
+        pruneDuplicateMirrorDocs(props.getColl().getCodegenResults(), codeGenResultId, mcp.getId(), microserviceId);
+        pruneDuplicateMirrorDocs(props.getColl().getMicroservice(), microserviceId, mcp.getId(), null);
+        pruneDuplicateMirrorDocs(props.getColl().getDeploymentArtifacts(), artifactId, mcp.getId(), null);
 
         // 5) Persist mirror state on our doc for idempotency. We keep the real
         //    gcsArchivePath HERE (our own field) even though the mirror doc
@@ -450,18 +460,49 @@ public class MicroserviceBridgeService {
      * leftovers from a pre-idempotency run. Best-effort; a failure here
      * never fails the deploy.
      */
-    private void pruneDuplicateMirrorDocs(String collection, String keepId, String mcpProjectId) {
-        if (mcpProjectId == null || mcpProjectId.isBlank() || keepId == null) return;
+    private void pruneDuplicateMirrorDocs(String collection, String keepId,
+                                          String mcpProjectId, String microserviceId) {
+        if (keepId == null) return;
+        java.util.List<org.bson.Document> ors = new java.util.ArrayList<>();
+        if (mcpProjectId != null && !mcpProjectId.isBlank()) {
+            ors.add(new org.bson.Document("mcpProjectId", mcpProjectId));
+        }
+        // Also match by microserviceId: a stray codegen_results row written by a
+        // path that doesn't stamp mcpProjectId (e.g. fsp-api-development-svc's
+        // own codegen) still has to go, because that service looks the row up by
+        // microserviceId and throws on more than one.
+        if (microserviceId != null && !microserviceId.isBlank()) {
+            ors.add(new org.bson.Document("microserviceId", microserviceId));
+        }
+        if (ors.isEmpty()) return;
         try {
-            org.bson.Document filter = new org.bson.Document("mcpProjectId", mcpProjectId)
+            org.bson.Document filter = new org.bson.Document("$or", ors)
                     .append("_id", new org.bson.Document("$ne", parseIdMaybe(keepId)));
             long removed = bridgeColl(collection).deleteMany(filter).getDeletedCount();
             if (removed > 0) {
-                log.warn("[bridge] pruned {} stale {} row(s) for mcpProjectId={} (kept _id={})",
-                        removed, collection, mcpProjectId, keepId);
+                log.warn("[bridge] pruned {} stale {} row(s) (mcpProjectId={} / microserviceId={}, kept _id={})",
+                        removed, collection, mcpProjectId, microserviceId, keepId);
             }
         } catch (Exception e) {
-            log.warn("[bridge] pruneDuplicateMirrorDocs({}, {}) failed: {}", collection, mcpProjectId, e.getMessage());
+            log.warn("[bridge] pruneDuplicateMirrorDocs({}) failed: {}", collection, e.getMessage());
+        }
+    }
+
+    /**
+     * Deterministic 24-hex ObjectId string derived from {@code seed}. Same seed
+     * → same id on every call, so concurrent {@code mirror()} invocations
+     * converge on one {@code _id} per mirror collection instead of each minting
+     * a random ObjectId and racing the de-dup prune.
+     */
+    private static String stableObjectId(String seed) {
+        try {
+            byte[] h = java.security.MessageDigest.getInstance("SHA-256")
+                    .digest(seed.getBytes(java.nio.charset.StandardCharsets.UTF_8));
+            StringBuilder sb = new StringBuilder(24);
+            for (int i = 0; i < 12; i++) sb.append(String.format("%02x", h[i]));
+            return sb.toString();
+        } catch (Exception e) {
+            return new ObjectId().toHexString();
         }
     }
 
