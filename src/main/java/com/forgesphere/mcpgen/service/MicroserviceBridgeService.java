@@ -2251,8 +2251,13 @@ public class MicroserviceBridgeService {
                     try (java.io.InputStream is = zf.getInputStream(e)) {
                         text = new String(is.readAllBytes(), java.nio.charset.StandardCharsets.UTF_8);
                     }
-                    text = tsPat.matcher(text).replaceAll("");
-                    if (text.length() > perStepMax) {
+                    // Per-step files: strip GitHub's per-line ISO timestamps (noise).
+                    // Whole-job fallback: KEEP them — the UI splits this into steps
+                    // by each step's time window, then strips per line itself.
+                    if (!whole) text = tsPat.matcher(text).replaceAll("");
+                    // Whole-job logs stay untruncated so the UI can carve every
+                    // step out; per-step files get the tail cap.
+                    if (!whole && text.length() > perStepMax) {
                         text = "…(truncated " + (text.length() - perStepMax) + " earlier chars)…\n"
                                 + text.substring(text.length() - perStepMax);
                     }
