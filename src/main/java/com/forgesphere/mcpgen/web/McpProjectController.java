@@ -1,5 +1,6 @@
 package com.forgesphere.mcpgen.web;
 
+import com.forgesphere.mcpgen.config.AuthenticatedCaller;
 import com.forgesphere.mcpgen.dto.Dtos.*;
 import com.forgesphere.mcpgen.model.McpProject;
 import com.forgesphere.mcpgen.model.McpProject.AuditActor;
@@ -77,11 +78,10 @@ public class McpProjectController {
     // ------------- CRUD -------------
     @PostMapping
     public Envelope<McpProject> create(@RequestBody McpProject body) {
-        // Senior's convention: `createdBy` + `updatedBy` come in as
-        // top-level strings on the payload. Persist them as-is so any
-        // existing Microservice/Proxy reader picks them up unchanged.
-        String actorEmail = body.getCreatedBy();
-        if (actorEmail == null || actorEmail.isBlank()) actorEmail = body.getUpdatedBy();
+        // The verified token's own email claim always wins when there is one — a client-supplied
+        // createdBy/updatedBy field can't be trusted for "who created this project". See
+        // AuthenticatedCaller's own javadoc.
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body.getCreatedBy(), body.getUpdatedBy());
         McpProject created = svc.create(body);
         if (actorEmail != null && !actorEmail.isBlank()) {
             created.setCreatedBy(actorEmail);
@@ -128,8 +128,7 @@ public class McpProjectController {
         if (body.getOnboarding()   != null) changed.add("onboarding");
         if (body.getConnectorId()  != null) changed.add("connector");
 
-        String actorEmail = body.getUpdatedBy();
-        if (actorEmail == null || actorEmail.isBlank()) actorEmail = body.getCreatedBy();
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body.getUpdatedBy(), body.getCreatedBy());
 
         McpProject saved = svc.update(id, body);
         // Mirror senior's pattern — keep the top-level `updatedBy` in sync
@@ -157,7 +156,8 @@ public class McpProjectController {
             svc.delete(id);
             return Envelope.ok(Map.of("deleted", id, "hard", true));
         }
-        McpProject p = svc.softDelete(id, audit.actor(actorEmail, null), reason);
+        String resolvedActorEmail = AuthenticatedCaller.resolveActorEmail(actorEmail);
+        McpProject p = svc.softDelete(id, audit.actor(resolvedActorEmail, null), reason);
         return Envelope.ok(Map.of(
                 "deleted",     id,
                 "softDeleted", true,
@@ -173,7 +173,7 @@ public class McpProjectController {
     @PostMapping("/{id}/restore")
     public Envelope<McpProject> restore(@PathVariable String id,
                                         @RequestBody(required = false) Map<String, Object> body) {
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body == null ? null : (String) body.get("updatedBy"));
         return Envelope.ok(svc.restore(id, audit.actor(actorEmail, null)));
     }
 
@@ -185,10 +185,9 @@ public class McpProjectController {
     @PostMapping("/{id}/clone")
     public Envelope<McpProject> clone(@PathVariable String id,
                                       @RequestBody(required = false) Map<String, Object> body) {
-        String actorEmail = body == null ? null : (String) body.get("createdBy");
-        if ((actorEmail == null || actorEmail.isBlank()) && body != null) {
-            actorEmail = (String) body.get("updatedBy");
-        }
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(
+                body == null ? null : (String) body.get("createdBy"),
+                body == null ? null : (String) body.get("updatedBy"));
         String newSlug = body == null ? null : (String) body.get("slug");
         McpProject copy = svc.clone(id, audit.actor(actorEmail, null), newSlug);
         audit.recordCreate(copy, audit.actor(actorEmail, null));
@@ -203,10 +202,9 @@ public class McpProjectController {
     @PostMapping("/{id}/version")
     public Envelope<McpProject> version(@PathVariable String id,
                                         @RequestBody(required = false) Map<String, Object> body) {
-        String actorEmail = body == null ? null : (String) body.get("createdBy");
-        if ((actorEmail == null || actorEmail.isBlank()) && body != null) {
-            actorEmail = (String) body.get("updatedBy");
-        }
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(
+                body == null ? null : (String) body.get("createdBy"),
+                body == null ? null : (String) body.get("updatedBy"));
         String newVersion = body == null ? null : (String) body.get("versionNumber");
         McpProject copy = svc.version(id, audit.actor(actorEmail, null), newVersion);
         audit.recordCreate(copy, audit.actor(actorEmail, null));
@@ -218,7 +216,7 @@ public class McpProjectController {
     @PostMapping("/{id}/deprecate")
     public Envelope<McpProject> deprecate(@PathVariable String id,
                                           @RequestBody(required = false) Map<String, Object> body) {
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body == null ? null : (String) body.get("updatedBy"));
         String reason     = body == null ? null : (String) body.get("reason");
         return Envelope.ok(svc.deprecate(id, audit.actor(actorEmail, null), reason));
     }
@@ -227,7 +225,7 @@ public class McpProjectController {
     @PostMapping("/{id}/undeprecate")
     public Envelope<McpProject> undeprecate(@PathVariable String id,
                                             @RequestBody(required = false) Map<String, Object> body) {
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body == null ? null : (String) body.get("updatedBy"));
         return Envelope.ok(svc.undeprecate(id, audit.actor(actorEmail, null)));
     }
 
@@ -244,7 +242,7 @@ public class McpProjectController {
         String stepName   = body == null ? null : (String) body.get("stepName");
         String status     = body == null ? "success" : String.valueOf(body.getOrDefault("status", "success"));
         String note       = body == null ? null : (String) body.get("note");
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body == null ? null : (String) body.get("updatedBy"));
         return Envelope.ok(svc.markStepComplete(id, stepNumber, stepName,
                 audit.actor(actorEmail, null), status, note));
     }
@@ -277,7 +275,7 @@ public class McpProjectController {
         @SuppressWarnings("unchecked")
         Map<String, Object> args = body == null ? Map.of()
                 : (Map<String, Object>) body.getOrDefault("arguments", Map.of());
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(body == null ? null : (String) body.get("updatedBy"));
 
         long started = System.currentTimeMillis();
         Map<String, Object> out = toolSimulator.simulate(p, toolName, args);
@@ -447,8 +445,9 @@ public class McpProjectController {
     public Envelope<Map<String, Object>> pushToGithub(@PathVariable String id,
                                                       @RequestBody(required = false) Map<String, Object> body) {
         McpProject p = svc.get(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
-        if ((actorEmail == null || actorEmail.isBlank()) && body != null) actorEmail = (String) body.get("createdBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(
+                body == null ? null : (String) body.get("updatedBy"),
+                body == null ? null : (String) body.get("createdBy"));
 
         boolean pipeline = bridgeSvc.isPipelineDeployEnabled();
         Map<String, Object> result;

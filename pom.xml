@@ -19,6 +19,9 @@
   <properties>
     <java.version>17</java.version>
     <project.build.sourceEncoding>UTF-8</project.build.sourceEncoding>
+    <!-- Same coordinates as forgecrux-token-demo-service, kept in sync across services -->
+    <forge.authn.version>[1.0.11-SNAPSHOT,)</forge.authn.version>
+    <forge.logging.version>[1.0.1-SNAPSHOT,)</forge.logging.version>
   </properties>
 
   <dependencies>
@@ -29,6 +32,10 @@
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-actuator</artifactId></dependency>
     <dependency><groupId>org.projectlombok</groupId><artifactId>lombok</artifactId><optional>true</optional></dependency>
     <dependency><groupId>com.fasterxml.jackson.datatype</groupId><artifactId>jackson-datatype-jsr310</artifactId></dependency>
+    <!-- Forge Authentication Library — JWT validation (RSA-256 / EdDSA) with OIDC discovery. -->
+    <dependency><groupId>com.forgecrux</groupId><artifactId>forge-auth-lib</artifactId><version>${forge.authn.version}</version></dependency>
+    <!-- Forge Logging Library — HTTP request/response logging with masking and correlation IDs. -->
+    <dependency><groupId>com.forge.libs</groupId><artifactId>forge-logging-lib</artifactId><version>${forge.logging.version}</version></dependency>
     <!-- GCS for persistent zip storage (same pattern as forgeq mgmt services) -->
     <dependency>
       <groupId>com.google.cloud</groupId>
@@ -38,8 +45,34 @@
     <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
   </dependencies>
 
+  <repositories>
+    <repository>
+      <id>repository.spring.milestone</id>
+      <name>Spring Milestone Repository</name>
+      <url>https://repo.spring.io/milestone</url>
+    </repository>
+    <!-- Same GAR repo forgecrux-token-demo-service resolves forge-auth-lib / forge-logging-lib from -->
+    <repository>
+      <id>probestack-java-lib-repo</id>
+      <url>artifactregistry://us-central1-maven.pkg.dev/probestack-prod/probestack-java-lib-repo</url>
+      <releases>
+        <enabled>true</enabled>
+      </releases>
+      <snapshots>
+        <enabled>true</enabled>
+      </snapshots>
+    </repository>
+  </repositories>
+
   <build>
     <finalName>fsp-mcp-generation-svc-${project.version}</finalName>
+    <extensions>
+      <extension>
+        <groupId>com.google.cloud.artifactregistry</groupId>
+        <artifactId>artifactregistry-maven-wagon</artifactId>
+        <version>2.2.0</version>
+      </extension>
+    </extensions>
     <plugins>
       <plugin>
         <groupId>org.springframework.boot</groupId>

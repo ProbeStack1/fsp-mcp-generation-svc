@@ -33,7 +33,12 @@ public class CorsConfig {
         }
         cfg.addAllowedMethod("*");
         cfg.addAllowedHeader("*");
-        cfg.setAllowCredentials(false);
+        // Was false — but the browser only ever attaches the HttpOnly ps_auth_token cookie
+        // (which CookieToHeaderBridgeFilter needs to see forge-auth-lib work at all) to a
+        // cross-origin request when the response carries Access-Control-Allow-Credentials.
+        // Safe to enable here: allowed origins is an explicit list (or an origin PATTERN,
+        // never the literal "*"), which is exactly what allowCredentials=true requires.
+        cfg.setAllowCredentials(true);
         cfg.setMaxAge(3600L);
 
         UrlBasedCorsConfigurationSource src = new UrlBasedCorsConfigurationSource();

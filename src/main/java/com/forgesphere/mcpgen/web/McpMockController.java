@@ -1,5 +1,6 @@
 package com.forgesphere.mcpgen.web;
 
+import com.forgesphere.mcpgen.config.AuthenticatedCaller;
 import com.forgesphere.mcpgen.dto.Dtos.Envelope;
 import com.forgesphere.mcpgen.model.McpMockServer;
 import com.forgesphere.mcpgen.service.McpMockService;
@@ -23,13 +24,15 @@ public class McpMockController {
     @PostMapping
     public Envelope<Map<String, Object>> generateMock(
             @PathVariable String projectId,
-            @RequestBody Map<String, Object> payload,
-            @RequestHeader(value = "X-User-Email", required = false) String userEmail) {
+            @RequestBody Map<String, Object> payload) {
 
         String transport = payload != null && payload.containsKey("transport")
                 ? payload.get("transport").toString()
                 : "http";
 
+        // The verified token's own email claim always wins when there is one — a client-supplied
+        // X-User-Email header can't be trusted for "who generated this mock".
+        String userEmail = AuthenticatedCaller.email().orElse(null);
         McpMockServer mock = mockService.createMockFromProject(projectId, transport, userEmail);
 
         Map<String, Object> response = new LinkedHashMap<>();
@@ -61,10 +64,9 @@ public class McpMockController {
     @PostMapping("/regenerate")
     public Envelope<Map<String, Object>> regenerate(
             @PathVariable String projectId,
-            @RequestBody Map<String, Object> payload,
-            @RequestHeader(value = "X-User-Email", required = false) String userEmail) {
+            @RequestBody Map<String, Object> payload) {
         mockService.deleteByProjectId(projectId);
-        return generateMock(projectId, payload, userEmail);
+        return generateMock(projectId, payload);
     }
 
     @GetMapping("/download")

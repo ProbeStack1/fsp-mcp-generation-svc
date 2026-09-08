@@ -1,5 +1,6 @@
 package com.forgesphere.mcpgen.web;
 
+import com.forgesphere.mcpgen.config.AuthenticatedCaller;
 import com.forgesphere.mcpgen.dto.Dtos.Envelope;
 import com.forgesphere.mcpgen.model.McpProject;
 import com.forgesphere.mcpgen.model.McpProject.AuditTrail;
@@ -121,8 +122,9 @@ public class McpAuditController {
                 .findFirst()
                 .orElseThrow(() -> new IllegalArgumentException("no deploy entry with runId=" + toRunId));
 
-        String actorEmail = body == null ? null : (String) body.get("updatedBy");
-        if (actorEmail == null && body != null) actorEmail = (String) body.get("createdBy");
+        String actorEmail = AuthenticatedCaller.resolveActorEmail(
+                body == null ? null : (String) body.get("updatedBy"),
+                body == null ? null : (String) body.get("createdBy"));
         var actor = (actorEmail == null || actorEmail.isBlank())
                 ? audit.fallbackActor(p)
                 : audit.actor(actorEmail, null);
