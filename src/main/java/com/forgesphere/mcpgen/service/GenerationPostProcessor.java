@@ -51,6 +51,18 @@ public class GenerationPostProcessor {
      */
     public List<GeneratedFile> apply(McpProject project, List<GeneratedFile> files) {
         Options opts = readOptions(project);
+        // Replace the old per-tool smoke scaffolds with executable native tests.
+        files.removeIf(f -> "tests/tools.test.ts".equals(f.getPath()));
+        if (opts.testsUnit) {
+            String language = lang(project);
+            if ("typescript".equals(language)) replaceFile(files, "tests/http.test.ts", com.forgesphere.mcpgen.generator.GeneratorUtils.template("http.test.ts"), "typescript");
+            if ("python".equals(language)) replaceFile(files, "tests/test_server.py", com.forgesphere.mcpgen.generator.GeneratorUtils.template("test_server.py"), "python");
+            if ("java".equals(language)) {
+                String pkg = "com.forgesphere.generated." + safeSlug(project).replace("-", "").toLowerCase();
+                replaceFile(files, "src/test/java/" + pkg.replace('.', '/') + "/McpControllerTest.java",
+                        com.forgesphere.mcpgen.generator.GeneratorUtils.template("McpControllerTest.java.template").replace("__PACKAGE__", pkg), "java");
+            }
+        }
 
         // 1) Drop test files the user unchecked. We classify by path
         //    pattern because the generators emit different filenames per
@@ -78,15 +90,18 @@ public class GenerationPostProcessor {
             files.add(loadTestStub(project));
         }
 
+        replaceFile(files, "tests/protocol.mjs", com.forgesphere.mcpgen.generator.GeneratorUtils.template("protocol.mjs"), "javascript");
         // 3) Helper artefacts. We dedupe by path so re-generation never
         //    creates two "postman/collection.json" entries.
-        if (opts.helpersPostman) {
+        if (opts.helpersPostman && isHttpTransport(project)) {
             replaceFile(files, "postman/collection.json", buildPostman(project), "json");
         }
+        if (opts.helpersPostman && !isHttpTransport(project)) replaceFile(files, "postman/README.md",
+                "Postman collections require an HTTP endpoint. This project uses stdio; run the generated protocol tests with MCP_STDIO_COMMAND, or regenerate using Streamable HTTP to use Postman.\n", "markdown");
         if (opts.helpersMcpInspector) {
             replaceFile(files, ".mcp-inspector/workspace.json", buildInspector(project), "json");
         }
-        if (opts.helpersDockerfile && isHttpTransport(project)) {
+        if (opts.helpersDockerfile && isHttpTransport(project) && !hasFileMatching(files, "Dockerfile"::equals)) {
             replaceFile(files, "Dockerfile", buildDockerfile(project), "dockerfile");
         }
         if (opts.helpersGithubWorkflows
@@ -99,12 +114,32 @@ public class GenerationPostProcessor {
         //    and `git diff` shows what changed across versions.
         if (opts.clientClaude)
             replaceFile(files, "client-configs/claude-desktop.json", buildClaudeConfig(project), "json");
+        if (opts.clientClaude && isHttpTransport(project)) {
+            replaceFile(files, "client-configs/http-bridge.mjs", com.forgesphere.mcpgen.generator.GeneratorUtils.template("http-bridge.mjs"), "javascript");
+            replaceFile(files, "client-configs/package.json", "{\"private\":true,\"type\":\"module\",\"dependencies\":{\"@modelcontextprotocol/sdk\":\"^1.12.0\"}}", "json");
+            replaceFile(files, "client-configs/README.md", "Run `npm install --prefix client-configs`. Replace absolute path placeholders in the client JSON with the extracted project location and replace token placeholders. Claude Desktop uses the included stdio-to-HTTP adapter. Cursor and VS Code use the HTTP endpoint directly. Set mcpUrl in Postman to your running endpoint.\n", "markdown");
+        }
+        if (opts.helpersGithubWorkflows && !isHttpTransport(project)) {
+            files.removeIf(f -> f.getPath().startsWith(".github/workflows/"));
+            replaceFile(files, ".github/workflows/ci.yml", buildCiWorkflow(project), "yaml");
+        }
         if (opts.clientCursor)
             replaceFile(files, "client-configs/cursor-mcp.json",     buildCursorConfig(project), "json");
         if (opts.clientForgeQ)
             replaceFile(files, "client-configs/forgeq.json",         buildForgeqConfig(project), "json");
         if (opts.clientVscode)
             replaceFile(files, "client-configs/vscode.json",         buildVscodeConfig(project), "json");
+
+        if (!opts.helpersDockerfile) files.removeIf(f -> "Dockerfile".equals(f.getPath()));
+        if (!opts.helpersGithubWorkflows) files.removeIf(f -> f.getPath().startsWith(".github/workflows/"));
+        if (!opts.testsUnit) for (GeneratedFile file : files) {
+            if (file.getPath().startsWith(".github/workflows/")) {
+                String content = file.getContent().replace("run: pytest -q", "run: echo 'Unit tests disabled in generation options'")
+                        .replace("run: npm test --silent", "run: echo 'Unit tests disabled in generation options'")
+                        .replace("run: mvn -B test", "run: echo 'Unit tests disabled in generation options'");
+                file.setContent(content); file.setBytes(content.getBytes(java.nio.charset.StandardCharsets.UTF_8).length);
+            }
+        }
 
         return files;
     }
@@ -226,94 +261,16 @@ public class GenerationPostProcessor {
 
     // ─────────── Stubs for the test kinds the generators skip ─────────
 
-    private GeneratedFile integrationTestStub(McpProject p) {
-        String lang = lang(p);
-        if ("python".equals(lang)) {
-            return file("tests/integration/test_tool_chain.py",
-                    "\"\"\"Integration tests — verify multi-tool flows. Fill in real assertions.\"\"\"\n"
-                            + "import pytest\nfrom server import mcp\n\n"
-                            + "@pytest.mark.integration\n"
-                            + "def test_tool_chain_smoke():\n"
-                            + "    assert mcp is not None\n", "python");
-        }
-        if ("java".equals(lang)) {
-            return file("src/test/java/integration/ToolChainIntegrationTest.java",
-                    "package integration;\nimport org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.*;\n\n"
-                            + "class ToolChainIntegrationTest {\n"
-                            + "  @Test void smoke() { assertTrue(true, \"replace with a real tool-chain assertion\"); }\n"
-                            + "}\n", "java");
-        }
-        return file("tests/integration/tool-chain.integration.test.ts",
-                "import { describe, expect, it } from 'vitest';\n\n"
-                        + "describe('tool chain integration', () => {\n"
-                        + "  it('runs end-to-end', () => { expect(true).toBe(true); });\n"
-                        + "});\n", "typescript");
+    private GeneratedFile integrationTestStub(McpProject p) { return protocolTest("integration"); }
+    private GeneratedFile contractTestStub(McpProject p) { return protocolTest("contract"); }
+    private GeneratedFile fuzzTestStub(McpProject p) { return protocolTest("fuzz"); }
+    private GeneratedFile loadTestStub(McpProject p) { return protocolTest("load"); }
+    private GeneratedFile protocolTest(String kind) {
+        return file("tests/" + kind + "/run.mjs", "process.env.MCP_TEST_KIND = '" + kind + "';\nawait import('../protocol.mjs');\n", "javascript");
     }
-
-    private GeneratedFile contractTestStub(McpProject p) {
-        String lang = lang(p);
-        if ("python".equals(lang)) {
-            return file("tests/contract/test_capability_contract.py",
-                    "\"\"\"Contract tests — assert tool list matches the MCP spec.\"\"\"\n"
-                            + "import pytest\nfrom server import mcp\n\n"
-                            + "def test_tools_match_spec(): assert mcp is not None\n", "python");
-        }
-        if ("java".equals(lang)) {
-            return file("src/test/java/contract/CapabilityContractTest.java",
-                    "package contract;\nimport org.junit.jupiter.api.Test;\nimport static org.junit.jupiter.api.Assertions.*;\n\n"
-                            + "class CapabilityContractTest {\n"
-                            + "  @Test void toolsMatchSpec() { assertTrue(true); }\n"
-                            + "}\n", "java");
-        }
-        return file("tests/contract/capability.contract.test.ts",
-                "import { describe, expect, it } from 'vitest';\n\n"
-                        + "describe('MCP capability contract', () => {\n"
-                        + "  it('lists every declared tool', () => { expect(true).toBe(true); });\n"
-                        + "});\n", "typescript");
-    }
-
-    private GeneratedFile fuzzTestStub(McpProject p) {
-        return file("tests/fuzz/tool-input.fuzz.test.ts",
-                "import { describe, expect, it } from 'vitest';\n\n"
-                        + "// Replace with a real property-based fuzzer (e.g. fast-check)\n"
-                        + "describe('tool input fuzz', () => {\n"
-                        + "  it('rejects random garbage gracefully', () => { expect(true).toBe(true); });\n"
-                        + "});\n", "typescript");
-    }
-
-    private GeneratedFile loadTestStub(McpProject p) {
-        return file("tests/load/tool-call.load.test.ts",
-                "// k6 / artillery-shaped load test. Run separately from `npm test`.\n"
-                        + "// Replace this stub with the real spec when load testing is wired up.\n"
-                        + "export const options = { vus: 5, duration: '10s' };\n"
-                        + "export default function () { /* call /mcp here */ }\n", "javascript");
-    }
-
-    // ─────────── Helper artefact builders ─────────────────────────────
-
     private String buildPostman(McpProject p) {
-        Map<String, Object> coll = new LinkedHashMap<>();
-        Map<String, Object> info = new LinkedHashMap<>();
-        info.put("name", p.getIdentity() == null ? "MCP Server" : p.getIdentity().getDisplayName());
-        info.put("schema", "https://schema.getpostman.com/json/collection/v2.1.0/collection.json");
-        info.put("_postman_id", UUID.randomUUID().toString());
-        coll.put("info", info);
-        List<Map<String, Object>> items = new ArrayList<>();
-        items.add(postmanItem("initialize",
-                "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}", p));
-        if (p.getCapabilities() != null && p.getCapabilities().getTools() != null) {
-            int id = 2;
-            for (McpProject.Tool t : p.getCapabilities().getTools()) {
-                String body = String.format(
-                        "{\"jsonrpc\":\"2.0\",\"id\":%d,\"method\":\"tools/call\","
-                                + "\"params\":{\"name\":\"%s\",\"arguments\":{}}}", id++, t.getName());
-                items.add(postmanItem("tools/call · " + t.getName(), body, p));
-            }
-        }
-        coll.put("item", items);
-        return tryWrite(coll);
+        return new TestCollectionGenerator().generate(p).get("postmanCollection");
     }
-
     private Map<String, Object> postmanItem(String name, String body, McpProject p) {
         Map<String, Object> req = new LinkedHashMap<>();
         req.put("method", "POST");
@@ -329,12 +286,9 @@ public class GenerationPostProcessor {
     }
 
     private String buildInspector(McpProject p) {
-        Map<String, Object> ws = new LinkedHashMap<>();
-        ws.put("server", Map.of(
-                "name",    safeSlug(p),
-                "command", clientCommand(p),
-                "transport", p.getTransport() == null ? "stdio" : p.getTransport().getKind()));
-        return tryWrite(ws);
+        Map<String, Object> entry = new LinkedHashMap<>(clientEntry(p));
+        entry.put("type", isHttpTransport(p) ? "streamable-http" : "stdio");
+        return tryWrite(Map.of("mcpServers", Map.of(safeSlug(p), entry)));
     }
 
     private String buildDockerfile(McpProject p) {
@@ -387,7 +341,7 @@ public class GenerationPostProcessor {
                           - uses: actions/setup-python@v5
                             with: { python-version: "3.12" }
                           - run: pip install -r requirements.txt
-                          - run: ruff check . || true
+                          - run: ruff check .
                           - run: pytest -q
                     """;
             case "java"   -> """
@@ -403,7 +357,7 @@ public class GenerationPostProcessor {
                           - uses: actions/checkout@v4
                           - uses: actions/setup-java@v4
                             with: { distribution: "temurin", java-version: "17" }
-                          - run: ./mvnw -B verify
+                          - run: mvn -B verify
                     """;
             default       -> """
                     name: CI
@@ -418,7 +372,7 @@ public class GenerationPostProcessor {
                           - uses: actions/checkout@v4
                           - uses: actions/setup-node@v4
                             with: { node-version: "20" }
-                          - run: npm ci
+                          - run: npm install
                           - run: npm run build
                           - run: npm test
                     """;
@@ -426,28 +380,50 @@ public class GenerationPostProcessor {
     }
 
     private String buildClaudeConfig(McpProject p) {
+        if (isHttpTransport(p)) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            entry.put("command", "node");
+            entry.put("args", List.of("/absolute/path/to/client-configs/http-bridge.mjs", clientEntry(p).get("url")));
+            if (p.getAuth() != null && "bearer".equals(p.getAuth().getKind())) entry.put("env", Map.of("MCP_AUTH_TOKEN", "<your-token>"));
+            if (p.getAuth() != null && "api-key".equals(p.getAuth().getKind())) entry.put("env", Map.of("MCP_API_KEY", "<your-token>", "MCP_API_KEY_HEADER", p.getAuth().getHeaderName() == null ? "X-API-Key" : p.getAuth().getHeaderName()));
+            return tryWrite(Map.of("mcpServers", Map.of(safeSlug(p), entry)));
+        }
         return tryWrite(Map.of("mcpServers", Map.of(safeSlug(p),
-                Map.of("command", clientCommand(p), "args", List.of()))));
+                clientEntry(p))));
     }
 
     private String buildCursorConfig(McpProject p) {
         return tryWrite(Map.of("mcpServers", Map.of(safeSlug(p),
-                Map.of("command", clientCommand(p), "args", List.of()))));
+                clientEntry(p))));
     }
 
     private String buildForgeqConfig(McpProject p) {
-        Map<String, Object> cfg = new LinkedHashMap<>();
-        cfg.put("name",      safeSlug(p));
-        cfg.put("transport", p.getTransport() == null ? Map.of("kind", "stdio") : p.getTransport());
-        cfg.put("auth",      p.getAuth()      == null ? Map.of("kind", "none")  : p.getAuth());
-        cfg.put("command",   clientCommand(p));
-        return tryWrite(cfg);
+        return tryWrite(com.forgesphere.mcpgen.generator.GeneratorUtils.manifest(p));
     }
 
     private String buildVscodeConfig(McpProject p) {
         // Continue.dev / Cline both read this shape from .vscode/mcp.json.
-        return tryWrite(Map.of("mcpServers", Map.of(safeSlug(p),
-                Map.of("command", clientCommand(p), "args", List.of()))));
+        Map<String, Object> entry = new LinkedHashMap<>(clientEntry(p));
+        entry.put("type", isHttpTransport(p) ? "http" : "stdio");
+        return tryWrite(Map.of("servers", Map.of(safeSlug(p), entry)));
+    }
+
+    private Map<String, Object> clientEntry(McpProject p) {
+        if (isHttpTransport(p)) {
+            String url = p.getTransport().getBaseUrl();
+            if (url == null || url.isBlank()) url = "http://localhost:" + ("typescript".equals(lang(p)) ? "3500" : "8080") + "/mcp";
+            java.net.URI uri = java.net.URI.create(url);
+            if (uri.getPath() == null || uri.getPath().isEmpty() || "/".equals(uri.getPath())) url = uri.resolve("/mcp").toString();
+            Map<String, Object> entry = new LinkedHashMap<>(); entry.put("url", url);
+            if (p.getAuth() != null && "bearer".equals(p.getAuth().getKind())) entry.put("headers", Map.of("Authorization", "Bearer <your-token>"));
+            if (p.getAuth() != null && "api-key".equals(p.getAuth().getKind())) entry.put("headers", Map.of(p.getAuth().getHeaderName() == null ? "X-API-Key" : p.getAuth().getHeaderName(), "<your-token>"));
+            return entry;
+        }
+        return switch (lang(p)) {
+            case "python" -> Map.of("command", "python", "args", List.of("/absolute/path/to/server.py"));
+            case "java" -> Map.of("command", "java", "args", List.of("-jar", "/absolute/path/to/target/" + safeSlug(p) + "-0.1.0.jar"));
+            default -> Map.of("command", "node", "args", List.of("/absolute/path/to/dist/index.js"));
+        };
     }
 
     // ─────────── small helpers ────────────────────────────────────────
@@ -456,6 +432,14 @@ public class GenerationPostProcessor {
         return p.getRuntime() == null
                 ? "typescript"
                 : String.valueOf(p.getRuntime().getLanguage()).toLowerCase();
+    }
+
+    public Map<String, Object> clientConfigs(McpProject p) {
+        try {
+            return Map.of("claudeDesktop", json.readValue(buildClaudeConfig(p), Map.class),
+                    "cursor", json.readValue(buildCursorConfig(p), Map.class),
+                    "forgeq", json.readValue(buildForgeqConfig(p), Map.class));
+        } catch (Exception e) { throw new IllegalStateException("Cannot build MCP client configs", e); }
     }
 
     private static String safeSlug(McpProject p) {

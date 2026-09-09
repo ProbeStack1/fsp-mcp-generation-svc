@@ -47,7 +47,8 @@ public class JavaSpringGenerator implements CodeGenerator {
 
         List<GeneratedFile> files = new ArrayList<>();
 
-        files.add(file("pom.xml", pom(groupId, artifact), "xml"));
+        files.add(file("pom.xml", pom(groupId, artifact).replace("<version>0.1.0</version>", "<version>" + GeneratorUtils.projectVersion(spec) + "</version>")
+                .replace(artifact + "-0.1.0", artifact + "-" + GeneratorUtils.projectVersion(spec)), "xml"));
 
         String pkgDir = "src/main/java/" + groupId.replace('.', '/') + "/" + pkgLeaf;
         files.add(file(pkgDir + "/Application.java", """
@@ -107,73 +108,28 @@ public class JavaSpringGenerator implements CodeGenerator {
                     public OpenAPI openApi() {
                         return new OpenAPI().info(new Info()
                                 .title(%s)
-                                .version("0.1.0")
+                                .version(%s)
                                 .description("Auto-generated MCP server endpoints."));
                     }
                 }
-                """.formatted(pkg, displayQuoted), "java"));
+                """.formatted(pkg, displayQuoted, GeneratorUtils.pretty(GeneratorUtils.projectVersion(spec))), "java"));
 
-        files.add(file(pkgDir + "/McpController.java", """
-                package %s;
-
-                import org.springframework.web.bind.annotation.*;
-                import java.util.*;
-
-                /**
-                 * JSON-RPC-over-HTTP entry point. Handles:
-                 *   - initialize
-                 *   - tools/list
-                 *   - tools/call
-                 * Fill in the tool bodies where marked TODO.
-                 */
-                @RestController
-                @RequestMapping("/mcp")
-                public class McpController {
-
-                    @PostMapping
-                    public Map<String, Object> handle(@RequestBody Map<String, Object> req) {
-                        String method = (String) req.getOrDefault("method", "");
-                        Object id = req.get("id");
-                        switch (method) {
-                            case "initialize":
-                                return rpc(id, Map.of(
-                                    "protocolVersion", "2024-11-05",
-                                    "serverInfo", Map.of("name", %s, "version", "0.1.0"),
-                                    "capabilities", Map.of("tools", Map.of("listChanged", false))));
-                            case "tools/list":
-                                return rpc(id, Map.of("tools", listTools()));
-                            case "tools/call":
-                                @SuppressWarnings("unchecked") Map<String,Object> params = (Map<String,Object>) req.getOrDefault("params", Map.of());
-                                return rpc(id, Map.of("content", List.of(Map.of("type","text","text", callTool((String)params.get("name"), (Map)params.get("arguments"))))));
-                            default:
-                                return Map.of("jsonrpc","2.0","id",id,"error", Map.of("code",-32601,"message","method not found"));
-                        }
-                    }
-
-                    private Map<String, Object> rpc(Object id, Object result) {
-                        return Map.of("jsonrpc","2.0","id",id,"result",result);
-                    }
-
-                    private List<Map<String, Object>> listTools() {
-                        // TODO: fill with the tools defined in the wizard
-                        return List.of();
-                    }
-
-                    private String callTool(String name, Map<String, Object> args) {
-                        return "TODO: implement " + name + " with " + args;
-                    }
-                }
-                """.formatted(pkg, displayQuoted), "java"));
-
+        files.add(file(pkgDir + "/McpController.java", GeneratorUtils.template("McpController.java.template").replace("__PACKAGE__", pkg).replace("System.getenv(", "RuntimeEnvironment.get("), "java"));
+        files.add(file(pkgDir + "/RuntimeEnvironment.java", GeneratorUtils.template("RuntimeEnvironment.java.template").replace("__PACKAGE__", pkg), "java"));
+        files.removeIf(f -> f.getPath().endsWith("/HealthController.java"));
+        files.add(file(pkgDir + "/McpHttpFilter.java", GeneratorUtils.template("McpHttpFilter.java.template").replace("__PACKAGE__", pkg), "java"));
+        files.add(file("src/main/resources/server-spec.json", GeneratorUtils.runtimeSpec(spec), "json"));
         files.add(file("src/main/resources/application.properties",
-                "server.port=${PORT:8080}\nspring.application.name=" + artifact + "\nspringdoc.swagger-ui.path=/swagger-ui.html\nspringdoc.api-docs.path=/v3/api-docs\n",
+                "spring.config.import=optional:file:.env[.properties]\nserver.port=${PORT:8080}\nspring.application.name=" + artifact + "\nspringdoc.swagger-ui.path=/swagger-ui.html\nspringdoc.api-docs.path=/v3/api-docs\n",
                 "properties"));
 
         files.add(file(".env.example", GeneratorUtils.envExample(spec), "dotenv"));
-        files.add(file("Dockerfile", dockerfile(spec, artifact), "docker"));
+        String readyEnv = GeneratorUtils.envReady(spec);
+        if (readyEnv != null) files.add(file(".env", readyEnv, "dotenv"));
+        files.add(file("Dockerfile", dockerfile(spec, artifact).replace(artifact + "-0.1.0.jar", artifact + "-" + GeneratorUtils.projectVersion(spec) + ".jar"), "docker"));
         files.add(file("mcp.json", GeneratorUtils.pretty(GeneratorUtils.manifest(spec)), "json"));
         files.add(file("README.md", GeneratorUtils.commonReadme(spec) +
-                "\n## Run locally\n\n```bash\nmvn spring-boot:run\n# or:\nmvn package && java -jar target/" + artifact + "-0.1.0.jar\n```\n\n" +
+                "\n## Run locally\n\n```bash\nmvn spring-boot:run\n# or:\nmvn package && java -jar target/" + artifact + "-" + GeneratorUtils.projectVersion(spec) + ".jar\n```\n\n" +
                 "## Endpoints\n\n" +
                 "- `POST /mcp`            — JSON-RPC entry point\n" +
                 "- `GET  /healthz`        — liveness probe (used by Cloud Run deploy)\n" +
@@ -221,6 +177,8 @@ public class JavaSpringGenerator implements CodeGenerator {
                   </properties>
 
                   <dependencies>
+                    <dependency><groupId>com.github.erosb</groupId><artifactId>everit-json-schema</artifactId><version>1.14.4</version></dependency>
+                    <dependency><groupId>org.springframework.boot</groupId><artifactId>spring-boot-starter-test</artifactId><scope>test</scope></dependency>
                     <dependency>
                       <groupId>org.springframework.boot</groupId>
                       <artifactId>spring-boot-starter-web</artifactId>

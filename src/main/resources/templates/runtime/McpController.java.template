@@ -1,0 +1,181 @@
+package __PACKAGE__;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.http.ResponseEntity;
+import org.springframework.web.bind.annotation.*;
+import java.net.URI;
+import java.net.URLEncoder;
+import java.net.http.*;
+import java.nio.charset.StandardCharsets;
+import java.time.Duration;
+import java.util.*;
+import java.util.regex.Pattern;
+
+@RestController
+@RequestMapping("/mcp")
+public class McpController {
+    private final ObjectMapper json = new ObjectMapper();
+    private final JsonNode spec;
+    private final HttpClient http = HttpClient.newBuilder().connectTimeout(Duration.ofSeconds(10)).build();
+    public McpController() throws Exception {
+        try (var input = getClass().getResourceAsStream("/server-spec.json")) { spec = json.readTree(input); }
+    }
+    @PostMapping
+    public ResponseEntity<?> handle(@RequestBody JsonNode request,
+            @RequestHeader Map<String, String> headers) {
+        String authorization = headers.get("authorization");
+        if ("api-key".equals(spec.path("auth").path("kind").asText())) {
+            String token = System.getenv("MCP_API_KEY");
+            String header = spec.path("auth").path("headerName").asText("X-API-Key").toLowerCase(Locale.ROOT);
+            if (token == null || token.isBlank() || !token.equals(headers.get(header)))
+                return ResponseEntity.status(401).body(Map.of("error", "Unauthorized"));
+        }
+        if ("bearer".equals(spec.path("auth").path("kind").asText())) {
+            String token = System.getenv("MCP_AUTH_TOKEN");
+            if (token == null || token.isBlank() || !("Bearer " + token).equals(authorization))
+                return ResponseEntity.status(401).body(Map.of("error", "Unauthorized"));
+        }
+        Object id = request.has("id") ? json.convertValue(request.get("id"), Object.class) : null;
+        if (!"2.0".equals(request.path("jsonrpc").asText()) || !request.path("method").isTextual())
+            return ResponseEntity.badRequest().body(error(id, -32600, "Invalid Request"));
+        if (!request.has("id")) return ResponseEntity.accepted().build();
+        try {
+            Object result = dispatch(request.path("method").asText(), request.path("params"));
+            Map<String, Object> response = new LinkedHashMap<>();
+            response.put("jsonrpc", "2.0"); response.put("id", id); response.put("result", result);
+            return ResponseEntity.ok(response);
+        } catch (UnsupportedOperationException e) {
+            return ResponseEntity.ok(error(id, -32601, e.getMessage()));
+        } catch (IllegalArgumentException e) {
+            return ResponseEntity.ok(error(id, -32602, e.getMessage()));
+        } catch (Exception e) {
+            return ResponseEntity.ok(error(id, -32603, "Internal server error"));
+        }
+    }
+    private Object dispatch(String method, JsonNode params) throws Exception {
+        return switch (method) {
+            case "initialize" -> Map.of("protocolVersion", "2025-03-26", "serverInfo",
+                Map.of("name", spec.path("identity").path("displayName").asText("mcp-server"), "version", spec.path("version").asText("0.1.0")),
+                "capabilities", Map.of("tools", Map.of(), "resources", Map.of(), "prompts", Map.of()));
+            case "ping" -> Map.of();
+            case "tools/list" -> Map.of("tools", list("tools", "name", "description", "inputSchema"));
+            case "tools/call" -> callTool(find("tools", params.path("name").asText()), params.path("arguments"));
+            case "resources/list" -> Map.of("resources", resources(false));
+            case "resources/templates/list" -> Map.of("resourceTemplates", resources(true));
+            case "resources/read" -> readResource(params.path("uri").asText());
+            case "prompts/list" -> Map.of("prompts", list("prompts", "name", "description", "arguments"));
+            case "prompts/get" -> prompt(find("prompts", params.path("name").asText()), params.path("arguments"));
+            default -> throw new UnsupportedOperationException("Method not found: " + method);
+        };
+    }
+    private List<Map<String, Object>> list(String kind, String... fields) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (JsonNode item : spec.path("capabilities").path(kind)) {
+            Map<String, Object> entry = new LinkedHashMap<>();
+            for (String field : fields) if (item.hasNonNull(field)) entry.put(field, json.convertValue(item.get(field), Object.class));
+            if (kind.equals("tools")) entry.putIfAbsent("inputSchema", Map.of("type", "object"));
+            if (kind.equals("prompts")) {
+                List<Map<String, Object>> arguments = new ArrayList<>();
+                for (JsonNode arg : item.path("arguments")) {
+                    Map<String, Object> descriptor = new LinkedHashMap<>();
+                    for (String key : List.of("name", "description", "required"))
+                        if (arg.hasNonNull(key)) descriptor.put(key, json.convertValue(arg.get(key), Object.class));
+                    arguments.add(descriptor);
+                }
+                entry.put("arguments", arguments);
+            }
+            out.add(entry);
+        }
+        return out;
+    }
+    private JsonNode find(String kind, String name) {
+        for (JsonNode item : spec.path("capabilities").path(kind)) if (name.equals(item.path("name").asText())) return item;
+        throw new IllegalArgumentException("Unknown " + kind + ": " + name);
+    }
+    private List<Map<String, Object>> resources(boolean templates) {
+        List<Map<String, Object>> out = new ArrayList<>();
+        for (JsonNode r : spec.path("capabilities").path("resources")) {
+            String uri = r.path("uriTemplate").asText();
+            if (uri.contains("{") != templates) continue;
+            out.add(Map.of(templates ? "uriTemplate" : "uri", uri, "name", r.path("name").asText(),
+                "mimeType", r.path("mimeType").asText("text/plain")));
+        }
+        return out;
+    }
+    private Object readResource(String uri) {
+        for (JsonNode r : spec.path("capabilities").path("resources")) {
+            String template = r.path("uriTemplate").asText();
+            var keys = Pattern.compile("\\{([^}]+)}").matcher(template);
+            StringBuilder regex = new StringBuilder(); List<String> names = new ArrayList<>(); int start = 0;
+            while (keys.find()) { regex.append(Pattern.quote(template.substring(start, keys.start()))).append("([^/]+)"); names.add(keys.group(1)); start = keys.end(); }
+            regex.append(Pattern.quote(template.substring(start)));
+            var match = Pattern.compile(regex.toString()).matcher(uri);
+            if (!match.matches()) continue;
+            if (!r.hasNonNull("content")) throw new IllegalArgumentException("Resource content is not configured");
+            String content = r.get("content").asText();
+            for (int i = 0; i < names.size(); i++) content = content.replace("{{" + names.get(i) + "}}", match.group(i + 1));
+            return Map.of("contents", List.of(Map.of("uri", uri, "mimeType", r.path("mimeType").asText("text/plain"), "text", content)));
+        }
+        throw new IllegalArgumentException("Unknown resource: " + uri);
+    }
+    private Object prompt(JsonNode prompt, JsonNode args) {
+        for (JsonNode arg : prompt.path("arguments")) if (arg.path("required").asBoolean() && !args.hasNonNull(arg.path("name").asText()))
+            throw new IllegalArgumentException("Missing prompt argument: " + arg.path("name").asText());
+        var matcher = Pattern.compile("\\{\\{\\s*([^{}]+?)\\s*}}").matcher(prompt.path("template").asText(""));
+        String text = matcher.replaceAll(m -> java.util.regex.Matcher.quoteReplacement(args.path(m.group(1)).asText("")));
+        return Map.of("messages", List.of(Map.of("role", "user", "content", Map.of("type", "text", "text", text))));
+    }
+    private Object callTool(JsonNode tool, JsonNode args) {
+        try {
+            if (args.isMissingNode()) args = json.createObjectNode();
+            validate(tool.path("inputSchema"), args);
+            JsonNode binding = tool.path("http");
+            if (!binding.isObject()) throw new IllegalArgumentException("Tool has no HTTP binding. Configure its implementation before use.");
+            String base = System.getenv("UPSTREAM_BASE_URL");
+            if (base == null || base.isBlank()) base = binding.path("baseUrl").asText();
+            if (base.isBlank()) throw new IllegalArgumentException("Set UPSTREAM_BASE_URL");
+            String path = binding.path("path").asText(); List<String> query = new ArrayList<>();
+            var builder = HttpRequest.newBuilder().timeout(Duration.ofSeconds(30)).header("Accept", "application/json");
+            String auth = System.getenv("UPSTREAM_AUTHORIZATION"); if (auth != null) builder.header("Authorization", auth);
+            for (JsonNode p : binding.path("parameters")) {
+                JsonNode value = args.path(p.path("argument").asText());
+                String name = p.path("name").asText(); String location = p.path("in").asText();
+                if (location.equals("path")) {
+                    if (value.isMissingNode() || value.isNull()) throw new IllegalArgumentException("Missing path argument: " + name);
+                    path = path.replace("{" + name + "}", encode(parameterText(value)));
+                } else if (!value.isMissingNode() && !value.isNull()) {
+                    if (location.equals("header")) builder.header(name, parameterText(value));
+                    if (location.equals("query")) {
+                        if (value.isArray() && p.path("explode").asBoolean(true)) for (JsonNode element : value) query.add(encode(name) + "=" + encode(element.asText()));
+                        else query.add(encode(name) + "=" + encode(parameterText(value)));
+                    }
+                }
+            }
+            String url = base.replaceAll("/+$", "") + "/" + path.replaceAll("^/+", "");
+            if (!query.isEmpty()) url += (url.contains("?") ? "&" : "?") + String.join("&", query);
+            JsonNode body = args.path(binding.path("bodyArgument").asText(""));
+            var publisher = body.isMissingNode() ? HttpRequest.BodyPublishers.noBody() : HttpRequest.BodyPublishers.ofString(body.toString());
+            if (!body.isMissingNode()) builder.header("Content-Type", "application/json");
+            var response = http.send(builder.uri(URI.create(url)).method(binding.path("method").asText("GET"), publisher).build(), HttpResponse.BodyHandlers.ofString());
+            return toolResult(response.statusCode() < 200 || response.statusCode() >= 300, response.body());
+        } catch (Exception e) { return toolResult(true, e.getMessage() == null ? "Tool execution failed" : e.getMessage()); }
+    }
+    private void validate(JsonNode schema, JsonNode value) {
+        if (schema.isMissingNode() || schema.isNull()) return;
+        var compiled = org.everit.json.schema.loader.SchemaLoader.builder()
+                .schemaJson(new org.json.JSONObject(schema.toString())).draftV7Support().build().load().build();
+        try { compiled.validate(new org.json.JSONTokener(value.toString()).nextValue()); }
+        catch (org.everit.json.schema.ValidationException e) { throw new IllegalArgumentException("Invalid input: " + e.getAllMessages(), e); }
+    }
+    private String encode(String value) { return URLEncoder.encode(value, StandardCharsets.UTF_8).replace("+", "%20"); }
+    private String parameterText(JsonNode value) {
+        if (!value.isArray()) return value.asText();
+        List<String> parts = new ArrayList<>(); value.forEach(item -> parts.add(item.asText())); return String.join(",", parts);
+    }
+    private Object toolResult(boolean failed, String text) { return Map.of("isError", failed, "content", List.of(Map.of("type", "text", "text", text))); }
+    private Map<String, Object> error(Object id, int code, String message) {
+        Map<String, Object> result = new LinkedHashMap<>(); result.put("jsonrpc", "2.0"); result.put("id", id);
+        result.put("error", Map.of("code", code, "message", message)); return result;
+    }
+}

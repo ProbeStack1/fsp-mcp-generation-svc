@@ -21,20 +21,22 @@ public class McpMockRuntimeController {
             @PathVariable String mockUrl,
             @RequestBody Map<String, Object> request) {
 
-        String method = (String) request.get("method");
+        String method = request.get("method") instanceof String name ? name : null;
         Object params = request.get("params");
         Object id = request.get("id");
+        if (!request.containsKey("id") && method != null && method.startsWith("notifications/")) {
+            return ResponseEntity.accepted().build();
+        }
 
         try {
+            if (!"2.0".equals(request.get("jsonrpc")) || method == null) throw new IllegalArgumentException("Invalid JSON-RPC request");
             Object result = runtimeService.handleRequest(mockUrl, method, params, id);
             return ResponseEntity.ok(result);
         } catch (Exception e) {
             log.error("MCP mock error: {}", e.getMessage());
-            Map<String, Object> error = Map.of(
-                    "jsonrpc", "2.0",
-                    "error", Map.of("code", -32000, "message", e.getMessage()),
-                    "id", id
-            );
+            Map<String, Object> error = new java.util.LinkedHashMap<>();
+            error.put("jsonrpc", "2.0"); error.put("id", id);
+            error.put("error", Map.of("code", -32600, "message", "Invalid MCP request"));
             return ResponseEntity.badRequest().body(error);
         }
     }

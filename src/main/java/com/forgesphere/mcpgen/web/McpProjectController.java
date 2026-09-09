@@ -189,7 +189,8 @@ public class McpProjectController {
                 body == null ? null : (String) body.get("createdBy"),
                 body == null ? null : (String) body.get("updatedBy"));
         String newSlug = body == null ? null : (String) body.get("slug");
-        McpProject copy = svc.clone(id, audit.actor(actorEmail, null), newSlug);
+        McpProject copy = svc.clone(id, audit.actor(actorEmail, null), newSlug,
+                body == null ? null : (String) body.get("versionNumber"), body == null ? null : (String) body.get("displayName"));
         audit.recordCreate(copy, audit.actor(actorEmail, null));
         audit.save(copy);
         return Envelope.ok(copy);

@@ -50,11 +50,19 @@ public class McpProbeService {
                     "params", Map.of("protocolVersion", "2024-11-05",
                             "capabilities", Map.of(),
                             "clientInfo", Map.of("name", "forgeq-mcp-generation-svc", "version", "1.0.0")));
-            Map<?, ?> initRes = callRpc(req, initReq);
+            RpcSession session = new RpcSession();
+            Map<?, ?> initRes = callRpc(req, initReq, session);
+            callRpc(req, Map.of("jsonrpc", "2.0", "method", "notifications/initialized"), session);
 
             // 2) tools/list
             Map<String, Object> listReq = Map.of("jsonrpc", "2.0", "id", 2, "method", "tools/list");
-            Map<?, ?> listRes = callRpc(req, listReq);
+            Map<?, ?> initResult = (Map<?, ?>) initRes.get("result");
+            Map<?, ?> capabilities = initResult.get("capabilities") instanceof Map<?, ?> c ? c : Map.of();
+            Map<?, ?> listRes = capabilities.containsKey("tools") ? callRpc(req, listReq, session) : Map.of();
+            List<Map<String, Object>> resources = capabilities.containsKey("resources")
+                    ? extractList(callRpc(req, Map.of("jsonrpc", "2.0", "id", 4, "method", "resources/list"), session), "resources") : List.of();
+            List<Map<String, Object>> prompts = capabilities.containsKey("prompts")
+                    ? extractList(callRpc(req, Map.of("jsonrpc", "2.0", "id", 5, "method", "prompts/list"), session), "prompts") : List.of();
 
             long ms = System.currentTimeMillis() - start;
             Map<String, Object> serverInfo = initRes != null && initRes.get("result") instanceof Map<?, ?> r
@@ -62,7 +70,7 @@ public class McpProbeService {
                     ? new LinkedHashMap<>((Map<String, Object>) si) : Map.of();
             List<Map<String, Object>> tools = extractList(listRes, "tools");
 
-            return new ProbeResponse(true, ms, null, serverInfo, tools, List.of(), List.of(), false);
+            return new ProbeResponse(true, ms, null, serverInfo, tools, resources, prompts, false);
         } catch (Exception e) {
             return new ProbeResponse(false, System.currentTimeMillis() - start,
                     e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(),
@@ -86,11 +94,17 @@ public class McpProbeService {
                     "jsonrpc", "2.0", "id", 3, "method", "tools/call",
                     "params", Map.of("name", req.toolName(),
                             "arguments", req.arguments() == null ? Map.of() : req.arguments()));
-            ProbeRequest asProbe = new ProbeRequest(req.url(), req.transport(), req.authHeader(), false, null, null);
-            Map<?, ?> res = callRpc(asProbe, body);
+            ProbeRequest asProbe = new ProbeRequest(req.url(), req.transport(), req.authHeader(), false, null, null, req.authHeaderName());
+            RpcSession session = new RpcSession();
+            callRpc(asProbe, Map.of("jsonrpc", "2.0", "id", 1, "method", "initialize", "params",
+                    Map.of("protocolVersion", "2025-03-26", "capabilities", Map.of(), "clientInfo",
+                            Map.of("name", "forgesphere-probe", "version", "1.0.0"))), session);
+            callRpc(asProbe, Map.of("jsonrpc", "2.0", "method", "notifications/initialized"), session);
+            Map<?, ?> res = callRpc(asProbe, body, session);
             long ms = System.currentTimeMillis() - start;
             Object content = res == null ? null : ((Map<?, ?>) res).get("result");
-            return new CallResponse(true, ms, null, content, false);
+            boolean failed = content instanceof Map<?, ?> result && Boolean.TRUE.equals(result.get("isError"));
+            return new CallResponse(!failed, ms, failed ? "MCP tool returned isError" : null, content, false);
         } catch (Exception e) {
             return new CallResponse(false, System.currentTimeMillis() - start,
                     e.getMessage() == null ? e.getClass().getSimpleName() : e.getMessage(),
@@ -99,24 +113,40 @@ public class McpProbeService {
     }
 
     // -------------------------------------------------- internals
-    private Map<?, ?> callRpc(ProbeRequest req, Map<String, Object> body) {
-        var spec = wc.post().uri(req.url())
+    private static class RpcSession {
+        String id;
+        String version = "2025-03-26";
+    }
+
+    private Map<?, ?> callRpc(ProbeRequest req, Map<String, Object> body, RpcSession session) {
+        java.net.URI uri = java.net.URI.create(req.url());
+        String endpoint = uri.getPath() == null || uri.getPath().isEmpty() || "/".equals(uri.getPath())
+                ? uri.resolve("/mcp").toString() : req.url();
+        var spec = wc.post().uri(endpoint)
                 .headers(h -> {
-                    if (req.authHeader() != null && !req.authHeader().isBlank())
-                        h.set(HttpHeaders.AUTHORIZATION,
-                                req.authHeader().startsWith("Bearer ") ? req.authHeader() : "Bearer " + req.authHeader());
+                    if (session.id != null) h.set("Mcp-Session-Id", session.id);
+                    h.set("MCP-Protocol-Version", session.version);
+                    if (req.authHeader() != null && !req.authHeader().isBlank()) {
+                        String name = req.authHeaderName() == null || req.authHeaderName().isBlank() ? HttpHeaders.AUTHORIZATION : req.authHeaderName();
+                        h.set(name, name.equalsIgnoreCase(HttpHeaders.AUTHORIZATION) && !req.authHeader().startsWith("Bearer ")
+                                ? "Bearer " + req.authHeader() : req.authHeader());
+                    }
                 })
                 .bodyValue(body);
-        String raw = spec.retrieve()
-                .bodyToMono(String.class)
+        var response = spec.retrieve()
+                .toEntity(String.class)
                 .timeout(Duration.ofSeconds(15))
-                .onErrorReturn("{}")
                 .block();
+        if (response == null) throw new IllegalStateException("Empty MCP HTTP response");
+        String sid = response.getHeaders().getFirst("Mcp-Session-Id");
+        if (sid != null) session.id = sid;
+        String raw = response.getBody();
         try {
-            if (raw == null || raw.isBlank()) return Map.of();
+            if (!body.containsKey("id")) return Map.of();
+            if (raw == null || raw.isBlank()) throw new IllegalStateException("Empty MCP RPC response");
             // Streamable HTTP may return either a single JSON or SSE lines.
             if (raw.trim().startsWith("{")) {
-                return new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class);
+                return validateRpc(new com.fasterxml.jackson.databind.ObjectMapper().readValue(raw, Map.class), session);
             }
             // Find the last `data:` line and parse.
             String[] lines = raw.split("\\n");
@@ -124,14 +154,22 @@ public class McpProbeService {
                 if (lines[i].startsWith("data:")) {
                     String payload = lines[i].substring(5).trim();
                     if (!payload.isEmpty()) {
-                        return new com.fasterxml.jackson.databind.ObjectMapper().readValue(payload, Map.class);
+                        Map<?, ?> parsed = new com.fasterxml.jackson.databind.ObjectMapper().readValue(payload, Map.class);
+                        if (parsed.containsKey("result") || parsed.containsKey("error")) return validateRpc(parsed, session);
                     }
                 }
             }
-            return Map.of();
+            throw new IllegalStateException("MCP response contains no JSON-RPC result");
         } catch (Exception e) {
-            return Map.of();
+            throw new IllegalStateException(e.getMessage(), e);
         }
+    }
+
+    private Map<?, ?> validateRpc(Map<?, ?> response, RpcSession session) {
+        if (response.containsKey("error")) throw new IllegalStateException("MCP RPC error: " + response.get("error"));
+        if (!(response.get("result") instanceof Map<?, ?> result)) throw new IllegalStateException("Invalid MCP result");
+        if (result.get("protocolVersion") instanceof String version) session.version = version;
+        return response;
     }
 
     @SuppressWarnings("unchecked")

@@ -35,11 +35,13 @@ public class TypeScriptGenerator implements CodeGenerator {
         String sdkVersion = rt == null || rt.getSdkVersion() == null ? "^1.0.0" : rt.getSdkVersion();
 
         List<GeneratedFile> files = new ArrayList<>();
+        files.add(file("src/http.ts", GeneratorUtils.template("http.ts"), "typescript"));
+        files.add(file("server-spec.json", GeneratorUtils.runtimeSpec(spec), "json"));
 
         // ---- package.json ----
         Map<String, Object> pkg = new LinkedHashMap<>();
         pkg.put("name", id == null ? "mcp-server" : id.getSlug());
-        pkg.put("version", "0.1.0");
+        pkg.put("version", GeneratorUtils.projectVersion(spec));
         pkg.put("description", id == null ? "" : id.getSummary());
         pkg.put("type", "module");
         pkg.put("main", "dist/index.js");
@@ -51,6 +53,7 @@ public class TypeScriptGenerator implements CodeGenerator {
         Map<String, String> deps = new LinkedHashMap<>();
         deps.put("@modelcontextprotocol/sdk", sdkVersion);
         deps.put("zod", "^3.23.8");
+        deps.put("ajv", "^8.17.1");
         if (t != null && !"stdio".equals(t.getKind())) {
             deps.put("express", "^4.19.2");
             // dotenv is what bridges the .env file → process.env at runtime.
@@ -69,7 +72,7 @@ public class TypeScriptGenerator implements CodeGenerator {
         // before any test even runs, which derails the CI gate on the
         // first push. Only add the dep when we're actually going to ship
         // a test file (i.e. caps has at least one tool).
-        if (caps != null && !caps.getTools().isEmpty()) {
+        {
             devDeps.put("vitest", "^1.6.0");
             scripts.put("test", "vitest run");
         }
@@ -266,8 +269,8 @@ public class TypeScriptGenerator implements CodeGenerator {
                   const origin = req.headers.origin || "";
                   const allow = ALLOWED_ORIGINS === "*" ? "*" : (ALLOWED_ORIGINS.split(",").map((s: string) => s.trim()).includes(origin) ? origin : "");
                   if (allow) res.setHeader("Access-Control-Allow-Origin", allow);
-                  res.setHeader("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
-                  res.setHeader("Access-Control-Allow-Headers", "Content-Type, Authorization, Mcp-Session-Id");
+                  res.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+                  res.setHeader("Access-Control-Allow-Headers", req.headers['access-control-request-headers'] || "Content-Type, Authorization, X-API-Key, Mcp-Session-Id, MCP-Protocol-Version");
                   res.setHeader("Access-Control-Expose-Headers", "Mcp-Session-Id");
                   if (req.method === "OPTIONS") return res.sendStatus(204);
                   next();
@@ -280,6 +283,7 @@ public class TypeScriptGenerator implements CodeGenerator {
                 const RATE_LIMIT_PER_MIN = %d;
                 const buckets = new Map<string, { count: number; resetAt: number }>();
                 app.use((req, res, next) => {
+                  if (req.path !== '/mcp') return next();
                   const ip = (req.ip || req.socket.remoteAddress || "") as string;
                   const now = Date.now();
                   const b = buckets.get(ip) || { count: 0, resetAt: now + 60_000 };
@@ -293,14 +297,16 @@ public class TypeScriptGenerator implements CodeGenerator {
         if (hasAuth) sb.append("""
 
                 function requireAuth(req: any, res: any, next: any) {
-                  const header = req.headers["authorization"] || "";
-                  const expected = `Bearer ${process.env.MCP_AUTH_TOKEN || ""}`;
-                  if (!process.env.MCP_AUTH_TOKEN || header !== expected) {
+                  const header = req.headers[%s] || "";
+                  const token = process.env[%s];
+                  const expected = %s + (token || "");
+                  if (!token || header !== expected) {
                     return res.status(401).json({ error: "unauthorized" });
                   }
                   next();
                 }
-                """);
+                """.formatted(quote("api-key".equals(a.getKind()) ? (a.getHeaderName() == null || a.getHeaderName().isBlank() ? "x-api-key" : a.getHeaderName().toLowerCase()) : "authorization"),
+                        quote("api-key".equals(a.getKind()) ? "MCP_API_KEY" : "MCP_AUTH_TOKEN"), quote("api-key".equals(a.getKind()) ? "" : "Bearer ")));
 
         if (healthOn) sb.append("""
 
@@ -395,7 +401,8 @@ public class TypeScriptGenerator implements CodeGenerator {
         var caps = spec.getCapabilities();
         StringBuilder sb = new StringBuilder();
         sb.append("""
-                import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+                import { McpServer, ResourceTemplate } from "@modelcontextprotocol/sdk/server/mcp.js";
+                import { ListToolsRequestSchema, CallToolRequestSchema } from "@modelcontextprotocol/sdk/types.js";
                 import { z } from "zod";
 
                 """);
@@ -426,27 +433,38 @@ public class TypeScriptGenerator implements CodeGenerator {
                 """);
         sb.append("  const server = new McpServer({\n");
         sb.append("    name: ").append(quote(id == null ? "mcp-server" : id.getDisplayName())).append(",\n");
-        sb.append("    version: \"0.1.0\",\n");
-        sb.append("  });\n\n");
+        sb.append("    version: ").append(quote(GeneratorUtils.projectVersion(spec))).append(",\n");
+        sb.append("  }, { capabilities: { tools: {} } });\n\n");
 
         if (caps != null && !caps.getTools().isEmpty()) {
             sb.append("  // ---------- Tools ----------\n");
+            sb.append("  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [\n");
             for (Tool tool : caps.getTools()) {
-                String fnName = GeneratorUtils.sanitise(tool.getName());
-                sb.append("  server.registerTool(").append(quote(tool.getName())).append(", {\n");
-                sb.append("    description: ").append(quote(nz(tool.getDescription()))).append(",\n");
-                sb.append("    inputSchema: ").append(zodShapeFromSchema(tool.getInputSchema())).append(",\n");
-                sb.append("  }, ").append(fnName).append("Handler);\n\n");
+                sb.append("    { name: ").append(quote(tool.getName())).append(", description: ").append(quote(nz(tool.getDescription())))
+                        .append(", inputSchema: ").append(GeneratorUtils.pretty(tool.getInputSchema() == null ? Map.of("type", "object") : tool.getInputSchema())).append(" },\n");
             }
+            sb.append("  ] }));\n  server.server.setRequestHandler(CallToolRequestSchema, async request => {\n    switch (request.params.name) {\n");
+            for (Tool tool : caps.getTools()) sb.append("      case ").append(quote(tool.getName())).append(": return ")
+                    .append(GeneratorUtils.sanitise(tool.getName())).append("Handler(request.params.arguments ?? {});\n");
+            sb.append("      default: throw new Error('Unknown tool: ' + request.params.name);\n    }\n  });\n");
+        } else {
+            sb.append("  server.server.setRequestHandler(ListToolsRequestSchema, async () => ({ tools: [] }));\n");
         }
         if (caps != null && !caps.getResources().isEmpty()) {
             sb.append("  // ---------- Resources ----------\n");
             for (var r : caps.getResources()) {
                 sb.append("  server.registerResource(").append(quote(r.getName())).append(", ")
-                        .append(quote(r.getUriTemplate())).append(", {\n");
+                        .append(r.getUriTemplate().contains("{") ? "new ResourceTemplate(" + quote(r.getUriTemplate()) + ", { list: undefined })" : quote(r.getUriTemplate())).append(", {\n");
                 sb.append("    description: ").append(quote(nz(r.getDescription()))).append(",\n");
                 sb.append("    mimeType: ").append(quote(nz(r.getMimeType()))).append(",\n");
-                sb.append("  }, async (uri) => ({\n    contents: [{ uri: uri.href, text: \"TODO: return resource contents\" }]\n  }));\n\n");
+                if (r.getContent() == null) {
+                    sb.append("  }, async () => { throw new Error('Resource content is not configured'); });\n");
+                } else {
+                    sb.append(r.getUriTemplate().contains("{") ? "  }, async (uri, variables) => ({ contents: [{ uri: uri.href, text: " : "  }, async (uri) => ({ contents: [{ uri: uri.href, text: ")
+                            .append(quote(r.getContent()));
+                    if (r.getUriTemplate().contains("{")) sb.append(".replace(/\\{\\{\\s*([^{}]+?)\\s*\\}\\}/g, (_, key) => String(variables[key] ?? ''))");
+                    sb.append(" }] }));\n");
+                }
             }
         }
         if (caps != null && !caps.getPrompts().isEmpty()) {
@@ -458,13 +476,13 @@ public class TypeScriptGenerator implements CodeGenerator {
                 boolean first = true;
                 for (var arg : p.getArguments()) {
                     if (!first) sb.append(", ");
-                    sb.append(arg.getName()).append(": z.string()");
+                    sb.append(quote(arg.getName())).append(": z.string()");
                     if (!arg.isRequired()) sb.append(".optional()");
                     first = false;
                 }
                 sb.append("},\n  }, async (args) => ({\n");
-                sb.append("    messages: [{ role: \"user\" as const, content: { type: \"text\" as const, text: `")
-                        .append(escapeBacktick(nz(p.getTemplate()))).append("` } }]\n  }));\n\n");
+                sb.append("    messages: [{ role: \"user\" as const, content: { type: \"text\" as const, text: ")
+                        .append(quote(nz(p.getTemplate()))).append(".replace(/\\{\\{\\s*([^{}]+?)\\s*\\}\\}/g, (_, key) => String(args[key] ?? '')) } }]\n  }));\n\n");
             }
         }
 
@@ -477,30 +495,10 @@ public class TypeScriptGenerator implements CodeGenerator {
         String props  = tool.getInputSchema() == null
                 ? "args: any"
                 : "args: { " + schemaParamsTs(tool.getInputSchema()) + " }";
-        return """
-                /**
-                 * %s — %s
-                 *
-                 * Side effects: %s
-                 * Implementation hint: %s
-                 */
-                export async function %sHandler(%s) {
-                  // TODO: implement the real logic. The scaffold below returns a
-                  // placeholder so the server boots and Claude can call it.
-                  // `as const` widens nothing — the MCP SDK demands the literal
-                  // type "text" (not just any string) and tsc would otherwise
-                  // widen the object literal and reject the registerTool call.
-                  return {
-                    content: [{ type: "text" as const, text: `TODO: implement %s — received ${JSON.stringify(args)}` }],
-                  };
-                }
-                """.formatted(
-                tool.getName(), nz(tool.getDescription()),
-                nz(tool.getSideEffects()),
-                nz(tool.getImplementationHint()).replace("\n", " "),
-                fnName, props, tool.getName());
+        return "import { callHttp, validateInput } from '../http.js';\nexport async function " + fnName
+                + "Handler(args: Record<string, any>) { const invalid = validateInput(" + GeneratorUtils.pretty(tool.getInputSchema()) + ", args); if (invalid) return invalid; return callHttp("
+                + GeneratorUtils.pretty(tool.getHttp()) + ", args); }\n";
     }
-
     private String toolsIndex(List<Tool> tools) {
         StringBuilder sb = new StringBuilder();
         sb.append("// Re-export all tool handlers.\n");
@@ -564,7 +562,7 @@ public class TypeScriptGenerator implements CodeGenerator {
             String k = e.getKey().toString();
             Map<String, Object> v = e.getValue() instanceof Map ? (Map<String, Object>) e.getValue() : Map.of();
             if (i++ > 0) sb.append(", ");
-            sb.append(k).append(": ").append(zodFromProp(v));
+            sb.append(quote(k)).append(": ").append(zodFromProp(v));
             if (!required.contains(k)) sb.append(".optional()");
         }
         sb.append(" }");
@@ -582,7 +580,7 @@ public class TypeScriptGenerator implements CodeGenerator {
             String k = e.getKey().toString();
             Map<String, Object> v = e.getValue() instanceof Map ? (Map<String, Object>) e.getValue() : Map.of();
             if (i++ > 0) sb.append("; ");
-            sb.append(k);
+            sb.append(quote(k));
             if (!required.contains(k)) sb.append("?");
             sb.append(": ").append(tsTypeFromProp(v));
         }
@@ -590,12 +588,14 @@ public class TypeScriptGenerator implements CodeGenerator {
     }
 
     private static String zodFromProp(Map<String, Object> v) {
+        if (v.get("type") == null || v.get("type") instanceof List<?>) return "z.any()";
         String t = v.get("type") == null ? "string" : v.get("type").toString();
         return switch (t) {
-            case "number", "integer" -> "z.number()";
+            case "number" -> "z.number()";
+            case "integer" -> "z.number().int()";
             case "boolean" -> "z.boolean()";
-            case "array"   -> "z.array(z.any())";
-            case "object"  -> "z.record(z.any())";
+            case "array"   -> "z.array(" + zodFromProp(v.get("items") instanceof Map<?, ?> items ? (Map<String, Object>) items : Map.of()) + ")";
+            case "object"  -> "z.object(" + zodShapeFromSchema(v) + ")";
             default        -> "z.string()";
         };
     }

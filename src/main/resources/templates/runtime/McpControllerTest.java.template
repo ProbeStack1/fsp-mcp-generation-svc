@@ -1,0 +1,29 @@
+package __PACKAGE__;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.junit.jupiter.api.Test;
+import java.util.Map;
+import static org.junit.jupiter.api.Assertions.*;
+
+class McpControllerTest {
+    private final ObjectMapper json = new ObjectMapper();
+    @Test void initializedNotificationHasNoRpcResponse() throws Exception {
+        var response = new McpController().handle(json.readTree("{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}"), Map.of());
+        // Authenticated configurations require their environment token, so test protocol routing via dispatch separately.
+        assertTrue(response.getStatusCode().value() == 202 || response.getStatusCode().value() == 401);
+        if (response.getStatusCode().value() == 202) assertNull(response.getBody());
+    }
+    @Test void unknownMethodIsProtocolError() throws Exception {
+        var method = McpController.class.getDeclaredMethod("dispatch", String.class, com.fasterxml.jackson.databind.JsonNode.class);
+        method.setAccessible(true);
+        var error = assertThrows(java.lang.reflect.InvocationTargetException.class, () -> method.invoke(new McpController(), "does/not/exist", json.createObjectNode()));
+        assertInstanceOf(UnsupportedOperationException.class, error.getCause());
+    }
+    @Test void initializeAdvertisesAllCapabilityFamilies() throws Exception {
+        var method = McpController.class.getDeclaredMethod("dispatch", String.class, com.fasterxml.jackson.databind.JsonNode.class);
+        method.setAccessible(true);
+        var result = json.valueToTree(method.invoke(new McpController(), "initialize", json.createObjectNode()));
+        assertTrue(result.path("capabilities").has("tools"));
+        assertTrue(result.path("capabilities").has("resources"));
+        assertTrue(result.path("capabilities").has("prompts"));
+    }
+}

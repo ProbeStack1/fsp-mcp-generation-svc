@@ -75,6 +75,9 @@ public class McpGenerationService {
         if (p.getTransport() == null)   p.setTransport(McpProject.Transport.builder().kind("streamable-http").baseUrl("http://localhost:3500/mcp").build());
         if (p.getAuth() == null)        p.setAuth(McpProject.Auth.builder().kind("bearer").headerName("Authorization").build());
         if (p.getAdvanced() == null)    p.setAdvanced(McpProject.Advanced.builder().build());
+        p.setVersionNumber("0.1.0");
+        if (p.getIdentity().getSlug() != null && !p.getIdentity().getSlug().isBlank())
+            p.setVersionKey(versionKey(p, p.getVersionNumber()));
 
         McpProject saved = repo.save(p);
 
@@ -136,6 +139,8 @@ public class McpGenerationService {
         if (patch.getSpecName()       != null) cur.setSpecName(patch.getSpecName());
         if (patch.getSpecSource()     != null) cur.setSpecSource(patch.getSpecSource());
         if (patch.getTestRunResults() != null) cur.setTestRunResults(patch.getTestRunResults());
+        if (cur.getVersionNumber() != null && cur.getIdentity() != null && cur.getIdentity().getSlug() != null)
+            cur.setVersionKey(versionKey(cur, cur.getVersionNumber()));
         cur.setUpdatedAt(Instant.now());
         return repo.save(cur);
     }
@@ -218,12 +223,20 @@ public class McpGenerationService {
      * so the clone starts at Step 1's "needs generate" state.
      */
     public McpProject clone(String id, McpProject.AuditActor actor, String newSlug) {
+        return clone(id, actor, newSlug, null, null);
+    }
+
+    public McpProject clone(String id, McpProject.AuditActor actor, String newSlug, String newVersion, String displayName) {
         McpProject src = mustGet(id);
         McpProject copy = deepCopy(src);
         copy.setId(UUID.randomUUID().toString());
         copy.setCloneOf(src.getId());
         copy.setVersionOf(null);
-        copy.setVersionNumber(null);
+        String initialVersion = newVersion == null || newVersion.isBlank() ? "0.1.0" : newVersion.trim();
+        if (!initialVersion.matches("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)"))
+            throw new IllegalArgumentException("Clone version must be a release number such as 1.2.3");
+        copy.setVersionNumber(initialVersion);
+        copy.setVersionKey(null);
         copy.setSoftDeleted(false);
         copy.setDeleteEvent(null);
         copy.setDeprecated(false);
@@ -236,10 +249,20 @@ public class McpGenerationService {
         // Slug nudge so the clone doesn't collide with the original in the same workspace.
         if (copy.getIdentity() != null) {
             String slug = newSlug != null && !newSlug.isBlank()
-                    ? newSlug
-                    : safeSlug(copy.getIdentity().getSlug()) + "-copy";
+                    ? newSlug.trim()
+                    : safeSlug(copy.getIdentity().getSlug()).substring(0, Math.min(58, safeSlug(copy.getIdentity().getSlug()).length())) + "-copy";
+            if (!slug.matches("[a-z][a-z0-9-]{1,62}")) throw new IllegalArgumentException("Clone slug must use lowercase letters, digits and hyphens (2-63 characters)");
+            String base = slug;
+            int suffix = 2;
+            while (!repo.findByWorkspaceIdAndIdentitySlugOrderByCreatedAtDesc(copy.getWorkspaceId(), slug).isEmpty()) {
+                if (newSlug != null && !newSlug.isBlank()) throw new IllegalArgumentException("A project with this clone slug already exists");
+                String ending = "-" + suffix++;
+                slug = base.substring(0, Math.min(base.length(), 63 - ending.length())) + ending;
+            }
             copy.getIdentity().setSlug(slug);
-            if (copy.getIdentity().getDisplayName() != null) {
+            copy.setVersionKey(versionKey(copy, copy.getVersionNumber()));
+            if (displayName != null && !displayName.isBlank()) copy.getIdentity().setDisplayName(displayName.trim());
+            else if (copy.getIdentity().getDisplayName() != null) {
                 copy.getIdentity().setDisplayName(copy.getIdentity().getDisplayName() + " (Copy)");
             }
         }
@@ -278,9 +301,18 @@ public class McpGenerationService {
         copy.setId(UUID.randomUUID().toString());
         copy.setVersionOf(src.getId());
         copy.setCloneOf(null);
-        copy.setVersionNumber(newVersion != null && !newVersion.isBlank()
-                ? newVersion
-                : nextSemver(src.getVersionNumber()));
+        var siblings = repo.findByWorkspaceIdAndIdentitySlugOrderByCreatedAtDesc(src.getWorkspaceId(), src.getIdentity().getSlug());
+        String latest = src.getVersionNumber() == null ? "0.1.0" : src.getVersionNumber();
+        for (McpProject sibling : siblings) {
+            String candidate = sibling.getVersionNumber();
+            if (candidate != null && candidate.matches("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)") && compareVersions(candidate, latest) > 0) latest = candidate;
+        }
+        String version = newVersion != null && !newVersion.isBlank() ? newVersion.trim() : nextSemver(latest);
+        if (!version.matches("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)"))
+            throw new IllegalArgumentException("Version must be a release number such as 1.2.3");
+        if (compareVersions(version, latest) <= 0) throw new IllegalArgumentException("New version must be greater than " + latest);
+        copy.setVersionNumber(version);
+        copy.setVersionKey(versionKey(copy, version));
         // A new version starts fresh on the whole generate/push/deploy
         // lifecycle — identical reset to clone() so the two never drift.
         resetLifecycleState(copy);
@@ -323,6 +355,14 @@ public class McpGenerationService {
      * reset once for both operations.
      */
     private static void resetLifecycleState(McpProject copy) {
+        copy.setGenerated(null);
+        copy.setMockServerId(null);
+        copy.setTestCollectionObjectKey(null);
+        copy.setDevBranch(null);
+        copy.setBranchTag(null);
+        if (copy.getTransport() != null && copy.getTransport().getBaseUrl() != null
+                && (copy.getTransport().getBaseUrl().equals(copy.getDeployedServiceUrl())
+                || copy.getTransport().getBaseUrl().equals(copy.getDeployedMcpUrl()))) copy.getTransport().setBaseUrl(null);
         // Mongo mirror docs (codegen_results / microservice / deployment_artifacts)
         copy.setMicroserviceMirrorId(null);
         copy.setDeploymentArtifactId(null);
@@ -437,11 +477,25 @@ public class McpGenerationService {
         String[] parts = prev.split("\\.");
         if (parts.length != 3) return prev + ".1";
         try {
-            int patch = Integer.parseInt(parts[2]);
-            return parts[0] + "." + parts[1] + "." + (patch + 1);
+              var patch = new java.math.BigInteger(parts[2]);
+              return parts[0] + "." + parts[1] + "." + patch.add(java.math.BigInteger.ONE);
         } catch (NumberFormatException e) {
             return prev + ".1";
         }
+    }
+
+    private static int compareVersions(String first, String second) {
+        String[] a = first.split("\\."); String[] b = second.split("\\.");
+        if (a.length != 3 || b.length != 3) throw new IllegalArgumentException("Existing version is not a valid release number");
+        for (int i = 0; i < 3; i++) {
+            int comparison = new java.math.BigInteger(a[i]).compareTo(new java.math.BigInteger(b[i]));
+            if (comparison != 0) return comparison;
+        }
+        return 0;
+    }
+
+    private static String versionKey(McpProject p, String version) {
+        return String.valueOf(p.getWorkspaceId()) + "|" + p.getIdentity().getSlug() + "|" + version;
     }
 
     /**
@@ -475,6 +529,14 @@ public class McpGenerationService {
 
     private McpProject generateInto(McpProject p) {
         String lang = p.getRuntime() == null ? "typescript" : p.getRuntime().getLanguage();
+        String transportKind = p.getTransport() == null ? "streamable-http" : p.getTransport().getKind();
+        if ("java".equalsIgnoreCase(lang) && !"streamable-http".equals(transportKind))
+            throw new IllegalArgumentException("Java generation currently supports Streamable HTTP; select that transport.");
+        if ("http-sse".equals(transportKind))
+            throw new IllegalArgumentException("Legacy SSE generation is not implemented. Select Streamable HTTP or stdio.");
+        String authKind = p.getAuth() == null ? "none" : p.getAuth().getKind();
+        if (authKind != null && !List.of("none", "bearer", "api-key").contains(authKind))
+            throw new IllegalArgumentException("OAuth/custom authentication requires a verified middleware implementation and cannot be generated yet.");
         CodeGenerator gen = generators.stream()
                 .filter(g -> g.language().equalsIgnoreCase(lang))
                 .findFirst()
@@ -658,27 +720,7 @@ public class McpGenerationService {
 
     // --------------------------------------------------- Client configs
     public Map<String, Object> clientConfigs(McpProject p) {
-        String slug = p.getIdentity() == null ? "mcp-server" : p.getIdentity().getSlug();
-        String baseUrl = p.getTransport() == null || p.getTransport().getBaseUrl() == null
-                ? "http://localhost:3500/mcp" : p.getTransport().getBaseUrl();
-        String transport = p.getTransport() == null ? "streamable-http" : p.getTransport().getKind();
-        boolean bearer = p.getAuth() != null && "bearer".equalsIgnoreCase(p.getAuth().getKind());
-        String token = bearer && p.getAuth().getGeneratedToken() != null ? p.getAuth().getGeneratedToken() : "<your-token>";
-
-        Map<String, Object> serverEntry = new LinkedHashMap<>();
-        serverEntry.put("url", baseUrl);
-        serverEntry.put("transport", transport);
-        if (bearer) serverEntry.put("headers", Map.of("Authorization", "Bearer " + token));
-
-        Map<String, Object> claude = Map.of("mcpServers", Map.of(slug, serverEntry));
-        Map<String, Object> cursor = Map.of("mcpServers", Map.of(slug, serverEntry));
-        Map<String, Object> forgeq = GeneratorUtilsProxy.manifest(p);
-
-        Map<String, Object> out = new LinkedHashMap<>();
-        out.put("claudeDesktop", claude);
-        out.put("cursor", cursor);
-        out.put("forgeq", forgeq);
-        return out;
+        return postProcessor.clientConfigs(p);
     }
 
     /** Tiny bridge so the service can reuse the manifest builder in GeneratorUtils. */

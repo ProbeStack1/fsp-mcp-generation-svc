@@ -14,7 +14,7 @@ import java.util.*;
  *   - Positive (happy path)
  *   - Negative (missing required args, invalid types)
  *   - Security (missing auth header)
- *   - Performance (simulated latency)
+ *   - Performance (measured response latency)
  *
  * The output is a Postman collection with a test script for each scenario,
  * plus a JSON metadata file that the Step 8 UI can parse to render the table.
@@ -64,8 +64,8 @@ public class TestCollectionGenerator {
             }
 
             // --- 3. Negative: invalid type ---
-            if (hasProperties(tool)) {
-                Map<String, Object> invalidArgs = generateInvalidTypeArgs(tool);
+            Map<String, Object> invalidArgs = generateInvalidTypeArgs(tool);
+            if (invalidArgs != null) {
                 Map<String, Object> invalidReq = buildRequest(serverUrl, toolName, invalidArgs, true);
                 items.add(createItem(toolName + " - Negative (invalid type)", invalidReq));
                 scenarioMetadata.add(createMeta(toolName, "NEGATIVE", "Invalid argument type", "400", invalidArgs, true));
@@ -78,13 +78,13 @@ public class TestCollectionGenerator {
                 scenarioMetadata.add(createMeta(toolName, "SECURITY", "Missing Authorization header", "401", validArgs, false));
             }
 
-            // --- 5. Performance: simulate latency (no actual delay, just marker) ---
+            // --- 5. Performance: the runner measures and enforces the latency threshold. ---
             Map<String, Object> perfReq = buildRequest(serverUrl, toolName, validArgs, true);
             items.add(createItem(toolName + " - Performance (latency test)", perfReq));
             scenarioMetadata.add(createMeta(toolName, "PERFORMANCE", "Response time threshold test", "200", validArgs, true));
         }
 
-        collection.put("item", items);
+        PostmanMcpSupport.prepare(collection, items, project);
         String postmanCollection;
         try {
             postmanCollection = json.writeValueAsString(collection);
@@ -145,6 +145,8 @@ public class TestCollectionGenerator {
                                             Map<String, Object> arguments, boolean withAuth) {
         Map<String, Object> meta = new LinkedHashMap<>();
         meta.put("toolName", toolName);
+        meta.put("id", toolName + ":" + category + ":" + description);
+        if ("PERFORMANCE".equals(category)) meta.put("maxLatencyMs", 2000);
         meta.put("category", category);
         meta.put("description", description);
         meta.put("expectedStatus", expectedStatus);
@@ -171,26 +173,42 @@ public class TestCollectionGenerator {
     @SuppressWarnings("unchecked")
     private Object generateValueForProp(Map<String, Object> prop, String key) {
         if (prop == null) return "sample-" + key;
+        if (prop.containsKey("example")) return prop.get("example");
+        if (prop.get("examples") instanceof List<?> examples && !examples.isEmpty()) return examples.get(0);
         if (prop.containsKey("default")) return prop.get("default");
         if (prop.get("enum") instanceof List<?> enumVals && !enumVals.isEmpty()) return enumVals.get(0);
-        String type = (String) prop.getOrDefault("type", "string");
+        Object declaredType = prop.getOrDefault("type", "string");
+        String type = declaredType instanceof List<?> types ? types.stream().filter(t -> !"null".equals(t)).map(String::valueOf).findFirst().orElse("null") : String.valueOf(declaredType);
         return switch (type) {
-            case "number" -> 42;
-            case "integer" -> 42;
+            case "number", "integer" -> {
+                double value = prop.get("minimum") instanceof Number n ? n.doubleValue() : 42;
+                if (prop.get("maximum") instanceof Number n) value = Math.min(value, n.doubleValue());
+                yield "integer".equals(type) ? (Object) (long) Math.ceil(value) : value;
+            }
             case "boolean" -> true;
             case "array" -> {
                 Object items = prop.get("items");
                 if (items instanceof Map) {
                     Map<String, Object> itemSchema = (Map<String, Object>) items;
-                    String itemType = (String) itemSchema.getOrDefault("type", "string");
-                    yield "object".equals(itemType)
-                            ? List.of(generateValidArgsFromSchema(itemSchema))
-                            : List.of(generateValueForProp(itemSchema, key));
+                    yield Collections.singletonList(generateValueForProp(itemSchema, key));
                 }
                 yield List.of("sample");
             }
             case "object" -> generateValidArgsFromSchema(prop);
-            default -> "sample-" + key;
+            case "null" -> null;
+            default -> {
+                String value = switch (String.valueOf(prop.get("format"))) {
+                    case "email" -> "test@example.com";
+                    case "uuid" -> "00000000-0000-4000-8000-000000000001";
+                    case "date" -> "2026-01-01";
+                    case "date-time" -> "2026-01-01T00:00:00Z";
+                    case "uri", "url" -> "https://example.com";
+                    default -> "sample-" + key;
+                };
+                if (prop.get("minLength") instanceof Number n && value.length() < n.intValue()) value += "x".repeat(Math.min(10000, n.intValue() - value.length()));
+                if (prop.get("maxLength") instanceof Number n && n.intValue() >= 0 && value.length() > n.intValue()) value = value.substring(0, n.intValue());
+                yield value;
+            }
         };
     }
 
@@ -229,26 +247,23 @@ public class TestCollectionGenerator {
     @SuppressWarnings("unchecked")
     private Map<String, Object> generateInvalidTypeArgs(Tool tool) {
         Map<String, Object> schema = tool.getInputSchema();
-        if (schema == null) return Map.of();
+        if (schema == null) return null;
         Object props = schema.get("properties");
-        if (!(props instanceof Map)) return Map.of();
+        if (!(props instanceof Map)) return null;
         Map<String, Object> propMap = (Map<String, Object>) props;
-        Map<String, Object> args = new LinkedHashMap<>();
+        Map<String, Object> args = new LinkedHashMap<>(generateValidArgs(tool));
         for (String key : propMap.keySet()) {
-            // swap type: string → number, number → string, etc.
-            Map<String, Object> prop = (Map<String, Object>) propMap.get(key);
-            String type = (String) prop.getOrDefault("type", "string");
-            Object value = switch (type) {
-                case "number" -> "not-a-number";
-                case "integer" -> "not-an-integer";
-                case "boolean" -> "not-a-boolean";
-                case "array" -> "not-an-array";
-                case "object" -> "not-an-object";
-                default -> 123; // string -> number
-            };
-            args.put(key, value);
+            if (!(propMap.get(key) instanceof Map<?, ?> prop) || prop.get("type") == null) continue;
+            Object declared = prop.get("type");
+            List<?> allowed = declared instanceof List<?> list ? list : List.of(declared);
+            Map<String, Object> candidates = new LinkedHashMap<>();
+            candidates.put("string", "invalid-type"); candidates.put("number", 123.5);
+            candidates.put("boolean", true); candidates.put("array", List.of()); candidates.put("object", Map.of()); candidates.put("null", null);
+            for (var candidate : candidates.entrySet()) if (!allowed.contains(candidate.getKey())) {
+                args.put(key, candidate.getValue()); return args;
+            }
         }
-        return args;
+        return null;
     }
 
     private boolean hasRequired(Tool tool) {

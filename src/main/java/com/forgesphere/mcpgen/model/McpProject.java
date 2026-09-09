@@ -267,6 +267,8 @@ public class McpProject {
      */
     private String versionOf;
     private String versionNumber;          // e.g. "1.0.0"
+    @Indexed(unique = true, sparse = true)
+    private String versionKey; // workspace/slug/version reservation for concurrent version creation
 
     /**
      * Per-step completion ledger driving the wizard's progress bar and the
@@ -355,6 +357,7 @@ public class McpProject {
         private String outputType;            // structured-json | text | markdown | image
         private String sideEffects;           // read-only | writes | destructive
         private String implementationHint;
+        private Map<String, Object> http; // method, baseUrl, path, parameters, bodyArgument
     }
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
@@ -364,6 +367,7 @@ public class McpProject {
         private String description;
         private String mimeType;              // application/json, text/plain, …
         private String mode;                  // static | dynamic
+        private String content;
     }
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor

@@ -134,6 +134,7 @@ public class McpMockService {
                     .id(UUID.randomUUID().toString())
                     .mockServerId(mockServerId)
                     .resourceName(resource.getName())
+                    .uriTemplate(resource.getUriTemplate())
                     .resourceDescription(resource.getDescription())
                     .mimeType(resource.getMimeType())
                     .mockData(generateMockResourceData(resource))
@@ -152,6 +153,7 @@ public class McpMockService {
                     .mockServerId(mockServerId)
                     .promptName(prompt.getName())
                     .promptDescription(prompt.getDescription())
+                    .arguments(prompt.getArguments())
                     .mockArguments(generateMockArguments(prompt))
                     .mockTemplate(generateMockTemplate(prompt))
                     .isActive(true)
@@ -279,47 +281,15 @@ public class McpMockService {
         List<McpProject.Resource> resources = project.getCapabilities().getResources();
         List<McpProject.Prompt> prompts = project.getCapabilities().getPrompts();
 
-        // Build a simple Node.js MCP mock server
-        StringBuilder indexJs = new StringBuilder();
-        indexJs.append("const { Server } = require('@modelcontextprotocol/sdk/server/index.js');\n");
-        indexJs.append("const { StdioServerTransport } = require('@modelcontextprotocol/sdk/server/stdio.js');\n");
-        indexJs.append("const { CallToolRequestSchema, ListToolsRequestSchema } = require('@modelcontextprotocol/sdk/types');\n\n");
-        indexJs.append("const server = new Server({\n");
-        indexJs.append("  name: 'mcp-mock',\n");
-        indexJs.append("  version: '1.0.0'\n");
-        indexJs.append("}, { capabilities: { tools: {} } });\n\n");
-        // List tools handler
-        indexJs.append("server.setRequestHandler(ListToolsRequestSchema, async () => ({\n");
-        indexJs.append("  tools: [\n");
-        for (McpProject.Tool t : tools) {
-            indexJs.append("    {\n");
-            indexJs.append("      name: '").append(t.getName()).append("',\n");
-            indexJs.append("      description: '").append(t.getDescription()).append("',\n");
-            indexJs.append("      inputSchema: ").append(t.getInputSchema()).append("\n");
-            indexJs.append("    },\n");
-        }
-        indexJs.append("  ]\n");
-        indexJs.append("}));\n\n");
-        // Tool call handler
-        indexJs.append("server.setRequestHandler(CallToolRequestSchema, async (request) => {\n");
-        indexJs.append("  const { name, arguments: args } = request.params;\n");
-        indexJs.append("  // Mock responses\n");
-        for (McpProject.Tool t : tools) {
-            String toolName = t.getName();
-            indexJs.append("  if (name === '").append(toolName).append("') {\n");
-            indexJs.append("    return {\n");
-            indexJs.append("      content: [{\n");
-            indexJs.append("        type: 'text',\n");
-            indexJs.append("        text: JSON.stringify(").append(generateMockResponseJson(t)).append(")\n");
-            indexJs.append("      }]\n");
-            indexJs.append("    };\n");
-            indexJs.append("  }\n");
-        }
-        indexJs.append("  throw new Error('Unknown tool: ' + name);\n");
-        indexJs.append("});\n\n");
-        indexJs.append("const transport = new StdioServerTransport();\n");
-        indexJs.append("server.connect(transport);\n");
-
+        Map<String, Object> mockSpec = new LinkedHashMap<>();
+        mockSpec.put("tools", tools); mockSpec.put("resources", resources); mockSpec.put("prompts", prompts);
+        Map<String, Object> responses = new LinkedHashMap<>();
+        for (var tool : tools) responses.put(tool.getName(), generateMockResponse(tool));
+        Map<String, Object> resourceData = new LinkedHashMap<>();
+        for (var resource : resources) resourceData.put(resource.getName(), generateMockResourceData(resource));
+        mockSpec.put("responses", responses); mockSpec.put("resourceData", resourceData);
+        StringBuilder indexJs = new StringBuilder(com.forgesphere.mcpgen.generator.GeneratorUtils.template("mock-stdio.cjs")
+                .replace("__SPEC__", com.forgesphere.mcpgen.generator.GeneratorUtils.pretty(mockSpec)));
         // package.json
         String packageJson = "{\n" +
                 "  \"name\": \"mcp-mock\",\n" +
@@ -330,7 +300,7 @@ public class McpMockService {
                 "    \"start\": \"node index.js\"\n" +
                 "  },\n" +
                 "  \"dependencies\": {\n" +
-                "    \"@modelcontextprotocol/sdk\": \"^1.0.0\"\n" +
+                "    \"@modelcontextprotocol/sdk\": \"^1.12.0\", \"ajv\": \"^8.17.1\"\n" +
                 "  }\n" +
                 "}\n";
 

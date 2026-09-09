@@ -1,0 +1,18 @@
+package __PACKAGE__;
+
+/** Environment variables take precedence over the optional local .env file. */
+final class RuntimeEnvironment {
+    private static final java.util.Properties LOCAL = new java.util.Properties();
+    static {
+        java.nio.file.Path file = java.nio.file.Path.of(".env");
+        if (java.nio.file.Files.exists(file)) {
+            try (var reader = java.nio.file.Files.newBufferedReader(file)) { LOCAL.load(reader); }
+            catch (java.io.IOException e) { throw new IllegalStateException("Cannot read local .env", e); }
+        }
+    }
+    static String get(String name) {
+        String value = System.getenv(name);
+        return value != null ? value : LOCAL.getProperty(name);
+    }
+    private RuntimeEnvironment() {}
+}

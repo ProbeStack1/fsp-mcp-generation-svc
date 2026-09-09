@@ -77,40 +77,80 @@ public class CollectionParserService {
     // ---------------- OpenAPI -----------------------------------------------
     private List<Map<String, Object>> fromOpenApi(JsonNode doc) {
         List<Map<String, Object>> out = new ArrayList<>();
-        JsonNode paths = doc.path("paths");
-        Iterator<String> it = paths.fieldNames();
-        String[] methods = { "get", "post", "put", "patch", "delete" };
-        while (it.hasNext()) {
-            String path = it.next();
-            JsonNode item = paths.path(path);
-            for (String m : methods) {
-                JsonNode op = item.path(m);
-                if (op.isMissingNode()) continue;
-                Map<String, Object> props = new LinkedHashMap<>();
-                List<String> required = new ArrayList<>();
-                op.path("parameters").forEach(p -> {
-                    String n = p.path("name").asText(); if (n.isEmpty()) return;
-                    props.put(n, Map.of("type", p.path("schema").path("type").asText("string"),
-                            "description", p.path("description").asText("")));
-                    if (p.path("required").asBoolean(false)) required.add(n);
-                });
-                JsonNode body = op.path("requestBody").path("content").path("application/json").path("schema");
-                if (!body.isMissingNode() && body.has("properties")) {
-                    body.path("properties").fields().forEachRemaining(e ->
-                            props.put(e.getKey(), Map.of("type", e.getValue().path("type").asText("string"),
-                                    "description", e.getValue().path("description").asText(""))));
-                    body.path("required").forEach(r -> { if (!required.contains(r.asText())) required.add(r.asText()); });
+        Set<String> names = new HashSet<>();
+        doc.path("paths").fields().forEachRemaining(entry -> {
+            String path = entry.getKey(); JsonNode item = resolve(doc, entry.getValue(), new HashSet<>());
+            for (String method : List.of("get", "post", "put", "patch", "delete", "head", "options")) {
+                JsonNode op = item.path(method); if (!op.isObject()) continue;
+                Map<String, JsonNode> parameters = new LinkedHashMap<>();
+                for (JsonNode source : List.of(item.path("parameters"), op.path("parameters"))) for (JsonNode raw : source) {
+                    JsonNode param = resolve(doc, raw, new HashSet<>());
+                    parameters.put(param.path("in").asText() + ":" + param.path("name").asText(), param);
                 }
-                out.add(tool(
-                        snake(op.path("operationId").asText(m + "_" + lastSeg(path))),
-                        firstNonBlank(op.path("summary").asText(""), op.path("description").asText(""), m.toUpperCase() + " " + path),
-                        props, required, m,
-                        "// " + m.toUpperCase() + " " + path));
+                Map<String, Object> props = new LinkedHashMap<>(); List<String> required = new ArrayList<>();
+                List<Map<String, Object>> bindings = new ArrayList<>();
+                for (JsonNode param : parameters.values()) {
+                    String name = param.path("name").asText(); String location = param.path("in").asText();
+                    if (!List.of("path", "query", "header").contains(location)) throw new IllegalArgumentException("Unsupported parameter location: " + location);
+                    String style = param.path("style").asText(location.equals("query") ? "form" : "simple");
+                    if (!style.equals(location.equals("query") ? "form" : "simple") || param.path("schema").path("type").asText().equals("object"))
+                        throw new IllegalArgumentException("Unsupported parameter serialization: " + name + " (" + style + ")");
+                    String argument = props.containsKey(name) ? location + "_" + name : name;
+                    props.put(argument, om.convertValue(resolve(doc, param.path("schema"), new HashSet<>()), Map.class));
+                    if (param.path("required").asBoolean() || location.equals("path")) required.add(argument);
+                    bindings.add(Map.of("name", name, "in", location, "argument", argument, "explode", param.path("explode").asBoolean(location.equals("query"))));
+                }
+                JsonNode requestBody = resolve(doc, op.path("requestBody"), new HashSet<>());
+                JsonNode body = requestBody.path("content").path("application/json").path("schema");
+                Map<String, Object> binding = new LinkedHashMap<>();
+                if (!body.isMissingNode()) {
+                    String argument = props.containsKey("body") ? "requestBody" : "body";
+                    props.put(argument, om.convertValue(resolve(doc, body, new HashSet<>()), Map.class));
+                    if (requestBody.path("required").asBoolean()) required.add(argument);
+                    binding.put("bodyArgument", argument);
+                } else if (requestBody.has("content")) throw new IllegalArgumentException("Only application/json request bodies are supported: " + path);
+                JsonNode servers = op.has("servers") ? op.path("servers") : item.has("servers") ? item.path("servers") : doc.path("servers");
+                JsonNode server = servers.path(0);
+                String baseUrl = server.path("url").asText("");
+                var matcher = java.util.regex.Pattern.compile("\\{([^}]+)}").matcher(baseUrl);
+                baseUrl = matcher.replaceAll(match -> {
+                    JsonNode value = server.path("variables").path(match.group(1)).path("default");
+                    if (value.isMissingNode() || value.isNull()) throw new IllegalArgumentException("Server variable requires a default: " + match.group(1));
+                    return java.util.regex.Matcher.quoteReplacement(value.asText());
+                });
+                binding.put("baseUrl", baseUrl);
+                binding.put("method", method.toUpperCase()); binding.put("path", path); binding.put("parameters", bindings);
+                String name = snake(op.path("operationId").asText(method + "_" + path));
+                if (!names.add(name)) throw new IllegalArgumentException("Duplicate tool name: " + name);
+                Map<String, Object> result = tool(name, firstNonBlank(op.path("summary").asText(), op.path("description").asText(), method.toUpperCase() + " " + path), props, required, method, "HTTP binding from OpenAPI");
+                result = new LinkedHashMap<>(result); result.put("http", binding); out.add(result);
             }
-        }
+        });
         return out;
     }
 
+    private JsonNode resolve(JsonNode doc, JsonNode value, Set<String> seen) {
+        if (value.has("$ref")) {
+            String ref = value.path("$ref").asText();
+            if (!ref.startsWith("#/")) throw new IllegalArgumentException("Only local OpenAPI references are supported: " + ref);
+            if (!seen.add(ref)) throw new IllegalArgumentException("Recursive OpenAPI schema requires an explicit finite tool schema: " + ref);
+            JsonNode target = doc.at(ref.substring(1));
+            if (target.isMissingNode()) throw new IllegalArgumentException("Unresolved OpenAPI reference: " + ref);
+            JsonNode resolved = resolve(doc, target, new HashSet<>(seen)); seen.remove(ref); return resolved;
+        }
+        if (value.isObject()) {
+            var result = om.createObjectNode();
+            value.fields().forEachRemaining(e -> result.set(e.getKey(), resolve(doc, e.getValue(), new HashSet<>(seen))));
+            if (result.path("nullable").asBoolean(false) && result.path("type").isTextual()) {
+                String type = result.path("type").asText(); result.putArray("type").add(type).add("null"); result.remove("nullable");
+            }
+            return result;
+        }
+        if (value.isArray()) {
+            var result = om.createArrayNode(); for (JsonNode child : value) result.add(resolve(doc, child, new HashSet<>(seen))); return result;
+        }
+        return value;
+    }
     // ---------------- Postman -----------------------------------------------
     private List<Map<String, Object>> fromPostman(JsonNode root) {
         List<Map<String, Object>> out = new ArrayList<>();

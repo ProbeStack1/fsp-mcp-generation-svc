@@ -50,7 +50,7 @@ public final class Dtos {
              *  `{ name, description, inputSchema, outputType? }`. */
             List<Map<String, Object>> tools,
             /** Optional override for the mock `serverInfo` block. */
-            Map<String, Object> serverInfo) {}
+            Map<String, Object> serverInfo, String authHeaderName) {}
 
     public record ProbeResponse(
             boolean ok, long ms, String error,
@@ -68,7 +68,7 @@ public final class Dtos {
             /** Optional. When `mock=true`, the mock response shape is
              *  derived from the tool spec so the user sees a result
              *  matching the tool they authored. */
-            Map<String, Object> toolSpec) {}
+            Map<String, Object> toolSpec, String authHeaderName) {}
 
     public record CallResponse(
             boolean ok, long ms, String error,

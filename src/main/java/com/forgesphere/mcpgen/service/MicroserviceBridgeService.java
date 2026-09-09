@@ -172,7 +172,12 @@ public class MicroserviceBridgeService {
         org.bson.Document doc = buildMicroserviceDocument(project, null);
 
         // Insert the doc
-        bridgeColl(props.getColl().getMicroservice()).insertOne(doc);
+        try {
+            bridgeColl(props.getColl().getMicroservice()).insertOne(doc);
+        } catch (RuntimeException failure) {
+            project.setMicroserviceMirrorId(null);
+            throw failure;
+        }
         log.info("[bridge] Created microservice record {} for MCP project {}",
                 microserviceId, project.getId());
 
@@ -219,6 +224,9 @@ public class MicroserviceBridgeService {
         doc.put("repositoryName", project.getRepositoryName());
         doc.put("mcpProjectId", project.getId());
         doc.put("mcpSlug", id == null ? null : id.getSlug());
+        doc.put("versionNumber", com.forgesphere.mcpgen.generator.GeneratorUtils.projectVersion(project));
+        doc.put("versionOf", project.getVersionOf());
+        doc.put("cloneOf", project.getCloneOf());
         doc.put("createdAt", now);
         doc.put("updatedAt", now);
         doc.put("_class", CLASS_MICROSERVICE);
@@ -1037,6 +1045,7 @@ public class MicroserviceBridgeService {
         } else {
             base = "mcp-server-" + (mcp.getId() != null ? mcp.getId() : UUID.randomUUID().toString());
         }
+        if (mcp.getVersionOf() != null) base += "-v" + com.forgesphere.mcpgen.generator.GeneratorUtils.projectVersion(mcp).replace('.', '-');
         return withMcpSuffix(base);
     }
 

@@ -1,0 +1,71 @@
+package __PACKAGE__;
+
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import jakarta.servlet.FilterChain;
+import jakarta.servlet.ServletException;
+import jakarta.servlet.http.HttpServletRequest;
+import jakarta.servlet.http.HttpServletResponse;
+import org.springframework.stereotype.Component;
+import org.springframework.web.filter.OncePerRequestFilter;
+import java.io.IOException;
+import java.util.Arrays;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.atomic.AtomicLong;
+
+@Component
+public class McpHttpFilter extends OncePerRequestFilter {
+    private final JsonNode advanced;
+    private final AtomicLong requests = new AtomicLong();
+    private final ConcurrentHashMap<String, long[]> buckets = new ConcurrentHashMap<>();
+    private static final org.slf4j.Logger LOG = org.slf4j.LoggerFactory.getLogger(McpHttpFilter.class);
+    public McpHttpFilter() throws IOException {
+        try (var input = getClass().getResourceAsStream("/server-spec.json")) {
+            advanced = new ObjectMapper().readTree(input).path("advanced");
+        }
+    }
+    @Override protected void doFilterInternal(HttpServletRequest request, HttpServletResponse response, FilterChain chain)
+            throws ServletException, IOException {
+        long start = System.nanoTime(); requests.incrementAndGet();
+        String path = request.getRequestURI();
+        JsonNode cors = advanced.path("cors");
+        if (cors.path("enabled").asBoolean(true)) {
+            String origin = request.getHeader("Origin");
+            String allowed = cors.path("allowedOrigins").asText("*");
+            if ("*".equals(allowed)) response.setHeader("Access-Control-Allow-Origin", "*");
+            else if (origin != null && Arrays.stream(allowed.split(",")).map(String::trim).anyMatch(origin::equals)) {
+                response.setHeader("Access-Control-Allow-Origin", origin); response.addHeader("Vary", "Origin");
+            }
+            response.setHeader("Access-Control-Allow-Methods", "GET,POST,DELETE,OPTIONS");
+            String headers = request.getHeader("Access-Control-Request-Headers");
+            response.setHeader("Access-Control-Allow-Headers", headers == null ? "Content-Type,Authorization,X-API-Key,MCP-Protocol-Version,Mcp-Session-Id" : headers);
+            response.setHeader("Access-Control-Expose-Headers", "MCP-Protocol-Version,Mcp-Session-Id");
+            if ("OPTIONS".equals(request.getMethod())) { response.setStatus(204); return; }
+        }
+        JsonNode health = advanced.path("healthCheck");
+        if ("GET".equals(request.getMethod()) && health.path("enabled").asBoolean(true)
+                && (path.equals(health.path("path").asText("/healthz")) || path.equals("/readyz"))) {
+            response.setContentType("application/json"); response.getWriter().write("{\"status\":\"ok\"}"); return;
+        }
+        JsonNode metrics = advanced.path("metrics");
+        if ("GET".equals(request.getMethod()) && metrics.path("enabled").asBoolean(false)
+                && path.equals(metrics.path("path").asText("/metrics"))) {
+            response.setContentType("text/plain");
+            response.getWriter().write("# TYPE mcp_requests_total counter\nmcp_requests_total " + requests.get() + "\n"); return;
+        }
+        if (path.equals("/mcp") && advanced.path("rateLimit").path("enabled").asBoolean(false)) {
+            long now = System.currentTimeMillis();
+            buckets.entrySet().removeIf(entry -> entry.getValue()[1] < now);
+            long[] bucket = buckets.computeIfAbsent(request.getRemoteAddr(), key -> new long[]{0, now + 60000});
+            synchronized (bucket) {
+                if (++bucket[0] > advanced.path("rateLimit").path("requestsPerMinute").asInt(60)) {
+                    response.setStatus(429); response.setContentType("application/json");
+                    response.getWriter().write("{\"error\":\"Rate limit exceeded\"}"); return;
+                }
+            }
+        }
+        try { chain.doFilter(request, response); }
+        finally { if (advanced.path("logging").path("enabled").asBoolean(true))
+            LOG.info("{} {} status={} durationMs={}", request.getMethod(), path, response.getStatus(), (System.nanoTime() - start) / 1000000); }
+    }
+}

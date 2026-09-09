@@ -25,6 +25,7 @@ public class McpMockResource {
     private String mockServerId;
 
     private String resourceName;
+    private String uriTemplate;
     private String resourceDescription;
     private String mimeType;
     private Map<String, Object> mockData;

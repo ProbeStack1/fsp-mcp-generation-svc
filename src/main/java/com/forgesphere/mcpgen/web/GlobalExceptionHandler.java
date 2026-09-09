@@ -14,6 +14,10 @@ import org.springframework.web.bind.annotation.ExceptionHandler;
  */
 @ControllerAdvice
 public class GlobalExceptionHandler {
+    @ExceptionHandler(org.springframework.dao.DuplicateKeyException.class)
+    public ResponseEntity<Envelope<Object>> duplicate(org.springframework.dao.DuplicateKeyException e) {
+        return ResponseEntity.status(HttpStatus.CONFLICT).body(Envelope.fail("This project/version already exists. Refresh and choose a new version."));
+    }
 
     @ExceptionHandler(IllegalArgumentException.class)
     public ResponseEntity<Envelope<Object>> badRequest(IllegalArgumentException e) {

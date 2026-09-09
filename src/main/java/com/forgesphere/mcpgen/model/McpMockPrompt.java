@@ -26,6 +26,7 @@ public class McpMockPrompt {
 
     private String promptName;
     private String promptDescription;
+    private java.util.List<McpProject.PromptArg> arguments;
     private Map<String, Object> mockArguments;
     private String mockTemplate;
 
