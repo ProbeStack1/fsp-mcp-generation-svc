@@ -528,6 +528,7 @@ public class McpGenerationService {
     }
 
     private McpProject generateInto(McpProject p) {
+        com.forgesphere.mcpgen.generator.GeneratorUtils.validateResources(p);
         String lang = p.getRuntime() == null ? "typescript" : p.getRuntime().getLanguage();
         String transportKind = p.getTransport() == null ? "streamable-http" : p.getTransport().getKind();
         if ("java".equalsIgnoreCase(lang) && !"streamable-http".equals(transportKind))

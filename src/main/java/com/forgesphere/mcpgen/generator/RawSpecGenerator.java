@@ -32,6 +32,7 @@ public class RawSpecGenerator implements CodeGenerator {
 
     @Override
     public List<GeneratedFile> generate(McpProject spec) {
+        GeneratorUtils.validateResources(spec);
         List<GeneratedFile> out = new ArrayList<>();
 
         // 1) mcp.json manifest — single source of truth for the protocol surface.

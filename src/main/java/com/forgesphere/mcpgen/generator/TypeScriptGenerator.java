@@ -27,6 +27,7 @@ public class TypeScriptGenerator implements CodeGenerator {
 
     @Override
     public List<GeneratedFile> generate(McpProject spec) {
+        GeneratorUtils.validateResources(spec);
         var id   = spec.getIdentity();
         var caps = spec.getCapabilities();
         var rt   = spec.getRuntime();

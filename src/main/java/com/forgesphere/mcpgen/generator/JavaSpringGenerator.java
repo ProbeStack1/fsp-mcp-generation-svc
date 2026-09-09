@@ -29,6 +29,7 @@ public class JavaSpringGenerator implements CodeGenerator {
 
     @Override
     public List<GeneratedFile> generate(McpProject spec) {
+        GeneratorUtils.validateResources(spec);
         var id   = spec.getIdentity();
         String artifact = id == null ? "mcp-server" : id.getSlug();
         String groupId  = "com.forgesphere.generated";

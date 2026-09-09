@@ -10,6 +10,7 @@ import java.util.List;
 public class PythonGenerator implements CodeGenerator {
     @Override public String language() { return "python"; }
     @Override public List<GeneratedFile> generate(McpProject spec) {
+        GeneratorUtils.validateResources(spec);
         List<GeneratedFile> files = new ArrayList<>();
         files.add(file("server.py", GeneratorUtils.template("server.py"), "python"));
         files.add(file("server-spec.json", GeneratorUtils.runtimeSpec(spec), "json"));

@@ -22,6 +22,18 @@ public final class GeneratorUtils {
 
     private GeneratorUtils() {}
 
+    public static void validateResources(McpProject spec) {
+        if (spec.getCapabilities() == null || spec.getCapabilities().getResources() == null) return;
+        int index = 0;
+        for (var resource : spec.getCapabilities().getResources()) {
+            index++;
+            if (resource == null || resource.getUriTemplate() == null || resource.getUriTemplate().isBlank()) {
+                String label = resource != null && resource.getName() != null ? resource.getName() : "#" + index;
+                throw new IllegalArgumentException("Resource '" + label + "' is missing its URI. Open Resources, set a URI or URI template, save the project, then generate again.");
+            }
+        }
+    }
+
     public static String pretty(Object obj) {
         try { return PRETTY.writeValueAsString(obj); }
         catch (JsonProcessingException e) { return "{}"; }

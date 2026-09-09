@@ -363,6 +363,11 @@ public class McpProject {
     @Data @Builder @NoArgsConstructor @AllArgsConstructor
     public static class Resource {
         private String uriTemplate;           // e.g. "repo://{owner}/{name}/issues"
+        private String uri; // Compatibility with static resources saved using the MCP wire field.
+
+        public String getUriTemplate() {
+            return uriTemplate == null || uriTemplate.isBlank() ? uri : uriTemplate;
+        }
         private String name;
         private String description;
         private String mimeType;              // application/json, text/plain, …
