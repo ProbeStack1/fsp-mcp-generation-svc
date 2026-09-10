@@ -32,6 +32,13 @@ class McpLifecycleTest {
         assertNull(copy.getZipObjectPath()); assertNull(copy.getDeploymentId()); assertNull(copy.getDeployedServiceUrl());
         assertNull(copy.getTestRunResults()); assertEquals("new-mirror", copy.getMicroserviceMirrorId());
     }
+    @Test void newProjectsAndDefaultClonesStartAtOneWithoutRewritingExistingVersions() {
+        var original = source(); original.setVersionNumber("0.1.0");
+        var created = service.create(McpProject.builder().workspaceId("workspace").identity(McpProject.Identity.builder().slug("new-server").build()).build());
+        assertEquals("1.0.0", created.getVersionNumber());
+        assertEquals("1.0.0", service.clone("original", null, null).getVersionNumber());
+        assertEquals("0.1.0", original.getVersionNumber());
+    }
     @Test void cloneDeepCopiesConfigurationAndClearsEveryRuntimePointer() {
         var original = source(); var copy = service.clone("original", null, null);
         assertFresh(copy); assertEquals("original", copy.getCloneOf()); assertNull(copy.getVersionOf());
@@ -49,6 +56,28 @@ class McpLifecycleTest {
         assertEquals("workspace|example|1.0.6", copy.getVersionKey());
         assertThrows(IllegalArgumentException.class, () -> service.version("original", null, "1.0.5"));
         assertThrows(IllegalArgumentException.class, () -> service.version("original", null, "banana"));
+    }
+    @Test void diffSectionsAndUpdateReportOnlyGenuinelyChangedSections() {
+        source();
+        // Patch re-sends every section but only changes `auth`.
+        var patch = McpProject.builder()
+                .identity(McpProject.Identity.builder().slug("example").displayName("Example").build())
+                .capabilities(McpProject.Capabilities.builder()
+                        .tools(new ArrayList<>(List.of(McpProject.Tool.builder().name("read")
+                                .http(new LinkedHashMap<>(Map.of("path", "/items"))).build()))).build())
+                .versionNumber("1.0.0")
+                .auth(McpProject.Auth.builder().kind("bearer").generatedToken("abc123").build())
+                .build();
+        assertEquals(List.of("auth"), service.diffSections("original", patch));
+
+        // A patch that changes nothing is a true no-op — no persist.
+        clearInvocations(repo);
+        var noop = McpProject.builder()
+                .identity(McpProject.Identity.builder().slug("example").displayName("Example").build())
+                .versionNumber("1.0.0").build();
+        assertTrue(service.diffSections("original", noop).isEmpty());
+        service.update("original", noop);
+        verify(repo, never()).save(any());
     }
     @Test void cloneHonorsRequestedNameVersionAndSlugWithoutChangingSource() {
         var original = source();

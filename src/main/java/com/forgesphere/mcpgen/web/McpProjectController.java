@@ -115,18 +115,12 @@ public class McpProjectController {
 
     @PutMapping("/{id}")
     public Envelope<McpProject> update(@PathVariable String id, @RequestBody McpProject body) {
-        // Capture which top-level sections were touched so the activity
-        // feed shows e.g. "edited Identity, Capabilities" rather than
-        // an opaque "updated" marker.
-        List<String> changed = new ArrayList<>();
-        if (body.getIdentity()     != null) changed.add("identity");
-        if (body.getCapabilities() != null) changed.add("capabilities");
-        if (body.getRuntime()      != null) changed.add("runtime");
-        if (body.getTransport()    != null) changed.add("transport");
-        if (body.getAuth()         != null) changed.add("auth");
-        if (body.getAdvanced()     != null) changed.add("advanced");
-        if (body.getOnboarding()   != null) changed.add("onboarding");
-        if (body.getConnectorId()  != null) changed.add("connector");
+        // Which top-level sections ACTUALLY differ from what's stored. The
+        // wizard re-PUTs the whole project on every "Next", so comparing
+        // values (not just "field present") is what keeps the activity
+        // feed meaningful — otherwise every step logs "Updated: identity,
+        // capabilities, runtime, transport, auth, advanced, …".
+        List<String> changed = svc.diffSections(id, body);
 
         String actorEmail = AuthenticatedCaller.resolveActorEmail(body.getUpdatedBy(), body.getCreatedBy());
 
@@ -136,8 +130,13 @@ public class McpProjectController {
         if (actorEmail != null && !actorEmail.isBlank()) {
             saved.setUpdatedBy(actorEmail);
         }
-        audit.recordEdit(saved, actorFromBody(actorEmail, saved), changed, "Updated: " + String.join(", ", changed));
-        audit.save(saved);
+        // No real change → no activity entry (and update() already skipped
+        // the write). Prevents a trail of empty "Updated:" rows.
+        if (!changed.isEmpty()) {
+            audit.recordEdit(saved, actorFromBody(actorEmail, saved), changed,
+                    "Updated: " + String.join(", ", changed));
+            audit.save(saved);
+        }
         return Envelope.ok(saved);
     }
 
@@ -617,6 +616,7 @@ public class McpProjectController {
     // ------------- Helpers -------------
     private GenerateResponse toGenerateResponse(McpProject p) {
         var g = p.getGenerated();
+        String authToken = p.getAuth() == null ? null : p.getAuth().getGeneratedToken();
         return new GenerateResponse(
                 p.getId(),
                 g == null ? 0 : g.getFiles().size(),
@@ -625,7 +625,9 @@ public class McpProjectController {
                         .map(f -> new FileSummary(f.getPath(), f.getBytes(), f.getMimeHint()))
                         .toList(),
                 g == null ? Instant.now().toString() : g.getGeneratedAt().toString(),
-                g == null ? null : g.getTestCollectionUrl()  // NEW
+                g == null ? null : g.getTestCollectionUrl(),  // NEW
+                g == null || g.getWarnings() == null ? List.of() : g.getWarnings(),
+                authToken == null || authToken.isBlank() ? null : authToken
         );
     }
 }

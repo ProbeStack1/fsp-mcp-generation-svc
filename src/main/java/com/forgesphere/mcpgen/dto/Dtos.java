@@ -28,12 +28,14 @@ public final class Dtos {
 
     // ---------- Generate ----------
     public record GenerateResponse(
-            String projectId, 
-            int fileCount, 
+            String projectId,
+            int fileCount,
             int totalBytes,
-            List<FileSummary> files, 
+            List<FileSummary> files,
             String generatedAt,
-            String testCollectionUrl) {}  // NEW: URL for scenario-based test collection
+            String testCollectionUrl,     // NEW: URL for scenario-based test collection
+            List<String> warnings,        // non-fatal review notes (auto-filled resource URI, auto-generated token…)
+            String authToken) {}          // effective bearer/api-key secret after generation (may have been auto-minted); null when auth=none
 
     public record FileSummary(String path, int bytes, String mimeHint) {}
 

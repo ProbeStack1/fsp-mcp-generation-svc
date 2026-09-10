@@ -14,12 +14,20 @@ class ResourceCompatibilityTest {
         assertEquals("docs://preferred", resource.getUriTemplate());
     }
 
-    @Test void everyGeneratorRejectsMissingUriWithActionableError() throws Exception {
-        var spec = new ObjectMapper().readValue("{\"capabilities\":{\"resources\":[{\"name\":\"broken-guide\"}]}}", McpProject.class);
+    @Test void everyGeneratorBackfillsAMissingUriInsteadOfFailing() throws Exception {
         for (var generator : List.of(new TypeScriptGenerator(), new PythonGenerator(), new JavaSpringGenerator(), new RawSpecGenerator())) {
-            var error = assertThrows(IllegalArgumentException.class, () -> generator.generate(spec));
-            assertTrue(error.getMessage().contains("broken-guide"));
-            assertTrue(error.getMessage().contains("missing its URI"));
+            var spec = new ObjectMapper().readValue("{\"capabilities\":{\"resources\":[{\"name\":\"broken-guide\"}]}}", McpProject.class);
+            assertDoesNotThrow(() -> generator.generate(spec));
+            assertEquals("resource://broken_guide",
+                    spec.getCapabilities().getResources().get(0).getUriTemplate());
         }
+    }
+
+    @Test void validateResourcesReturnsAReviewWarningPerBackfilledResource() throws Exception {
+        var spec = new ObjectMapper().readValue("{\"capabilities\":{\"resources\":[{\"name\":\"broken-guide\"}]}}", McpProject.class);
+        var warnings = GeneratorUtils.validateResources(spec);
+        assertEquals(1, warnings.size());
+        assertTrue(warnings.get(0).contains("broken-guide"));
+        assertTrue(warnings.get(0).contains("resource://broken_guide"));
     }
 }

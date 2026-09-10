@@ -22,16 +22,50 @@ public final class GeneratorUtils {
 
     private GeneratorUtils() {}
 
-    public static void validateResources(McpProject spec) {
-        if (spec.getCapabilities() == null || spec.getCapabilities().getResources() == null) return;
+    /**
+     * Backfills a default URI for any resource that was saved without one
+     * (common when a resource arrives via AI Synthesize or a pasted
+     * capabilities JSON rather than the Resources modal, which enforces
+     * the field). Mutates {@code spec} in place and returns one
+     * human-readable warning per auto-filled resource so the UI can nudge
+     * the user to review it.
+     *
+     * <p>This used to {@code throw} and hard-block generation. A blank URI
+     * is recoverable — {@code resource://<name>} is a valid MCP URI and
+     * the scaffold handles it — so we fill it and warn instead of
+     * stopping the wizard dead.
+     */
+    public static List<String> validateResources(McpProject spec) {
+        List<String> warnings = new ArrayList<>();
+        if (spec.getCapabilities() == null || spec.getCapabilities().getResources() == null) return warnings;
         int index = 0;
         for (var resource : spec.getCapabilities().getResources()) {
             index++;
-            if (resource == null || resource.getUriTemplate() == null || resource.getUriTemplate().isBlank()) {
-                String label = resource != null && resource.getName() != null ? resource.getName() : "#" + index;
-                throw new IllegalArgumentException("Resource '" + label + "' is missing its URI. Open Resources, set a URI or URI template, save the project, then generate again.");
+            if (resource == null) continue;
+            if (resource.getUriTemplate() == null || resource.getUriTemplate().isBlank()) {
+                String name = resource.getName() != null && !resource.getName().isBlank()
+                        ? resource.getName() : ("resource-" + index);
+                String uri = "resource://" + sanitise(name);
+                resource.setUriTemplate(uri);
+                warnings.add("Resource '" + name + "' had no URI — defaulted it to '" + uri
+                        + "'. Review it in Design → Resources.");
             }
         }
+        return warnings;
+    }
+
+    /**
+     * 32-byte hex secret for {@code bearer} / {@code api-key} auth —
+     * identical in shape to the wizard's "Generate" button
+     * ({@code McpLiveController#token}). Used to auto-provision a token at
+     * generation time when the user left it blank, so the value baked into
+     * {@code mcp.yml} ({@code MCP_AUTH_TOKEN} / {@code MCP_API_KEY}) and the
+     * value the Test page / MCP inspector send always agree.
+     */
+    public static String randomToken() {
+        byte[] buf = new byte[32];
+        new java.security.SecureRandom().nextBytes(buf);
+        return java.util.HexFormat.of().formatHex(buf);
     }
 
     public static String pretty(Object obj) {
@@ -279,6 +313,15 @@ public final class GeneratorUtils {
         String devBranch = p.getDevBranch() != null && !p.getDevBranch().isBlank()
                 ? p.getDevBranch() : "main";
         String branchTag    = p.getBranchTag()    != null ? p.getBranchTag()    : "";
+        // Second push-trigger branch: the CICD "merge"-tagged branch
+        // (branchTag, e.g. "release"), appended under on.push.branches so
+        // deploy also fires when code lands on the release branch. Mirrors
+        // how the api-development proxy flow carries both the feature branch
+        // and the merge branch — but on push only, no pull_request trigger.
+        // Omitted when branchTag is unset or identical to the dev branch.
+        String extraPushBranches = (!branchTag.isBlank() && !branchTag.equals(devBranch))
+                ? "\n      - " + branchTag
+                : "";
         // The id the pipeline uses to fetch the CICD filtered config —
         // that's the onboarding id (same value DeployService passes to
         // /cicd-config/{id}/all).
@@ -315,6 +358,7 @@ public final class GeneratorUtils {
                 .replace("${port}",        port)
                 .replace("${healthPath}",  healthPath)
                 .replace("${devBranch}",   devBranch)
+                .replace("${extraPushBranches}", extraPushBranches)
                 .replace("${branchTag}",   branchTag)
                 .replace("${cicdConfigId}", cicdConfigId);
     }

@@ -75,7 +75,7 @@ public class McpGenerationService {
         if (p.getTransport() == null)   p.setTransport(McpProject.Transport.builder().kind("streamable-http").baseUrl("http://localhost:3500/mcp").build());
         if (p.getAuth() == null)        p.setAuth(McpProject.Auth.builder().kind("bearer").headerName("Authorization").build());
         if (p.getAdvanced() == null)    p.setAdvanced(McpProject.Advanced.builder().build());
-        p.setVersionNumber("0.1.0");
+        p.setVersionNumber("1.0.0");
         if (p.getIdentity().getSlug() != null && !p.getIdentity().getSlug().isBlank())
             p.setVersionKey(versionKey(p, p.getVersionNumber()));
 
@@ -121,24 +121,63 @@ public class McpGenerationService {
 
     public Optional<McpProject> get(String id) { return repo.findById(id); }
 
+    private static final com.fasterxml.jackson.databind.ObjectMapper DIFF_JSON =
+            new com.fasterxml.jackson.databind.ObjectMapper();
+
+    /** Structural equality for a patch section vs. the stored value. A
+     *  null patch section means "not supplied" and never counts as a change. */
+    private static boolean sectionEq(Object patchValue, Object current) {
+        if (patchValue == null) return true;          // not supplied → no change
+        if (patchValue == current) return true;
+        try { return DIFF_JSON.valueToTree(patchValue).equals(DIFF_JSON.valueToTree(current)); }
+        catch (Exception e) { return false; }
+    }
+
+    /**
+     * The top-level sections whose incoming value actually differs from
+     * what's stored. The wizard re-sends the whole project on every
+     * "Next", so a plain "field present in body" check marked EVERYTHING
+     * changed on every step — this compares values so the activity feed
+     * reflects real edits.
+     */
+    public List<String> diffSections(String id, McpProject patch) {
+        McpProject cur = repo.findById(id).orElse(null);
+        if (cur == null) return List.of();
+        List<String> changed = new ArrayList<>();
+        if (!sectionEq(patch.getIdentity(),     cur.getIdentity()))     changed.add("identity");
+        if (!sectionEq(patch.getCapabilities(), cur.getCapabilities())) changed.add("capabilities");
+        if (!sectionEq(patch.getRuntime(),      cur.getRuntime()))      changed.add("runtime");
+        if (!sectionEq(patch.getTransport(),    cur.getTransport()))    changed.add("transport");
+        if (!sectionEq(patch.getAuth(),         cur.getAuth()))         changed.add("auth");
+        if (!sectionEq(patch.getAdvanced(),     cur.getAdvanced()))     changed.add("advanced");
+        if (!sectionEq(patch.getOnboarding(),   cur.getOnboarding()))   changed.add("onboarding");
+        if (patch.getConnectorId() != null
+                && !java.util.Objects.equals(patch.getConnectorId(), cur.getConnectorId())) changed.add("connector");
+        return changed;
+    }
+
     public McpProject update(String id, McpProject patch) {
         McpProject cur = repo.findById(id).orElseThrow(() -> new IllegalArgumentException("project not found: " + id));
-        if (patch.getIdentity()     != null) cur.setIdentity(patch.getIdentity());
-        if (patch.getCapabilities() != null) cur.setCapabilities(patch.getCapabilities());
-        if (patch.getRuntime()      != null) cur.setRuntime(patch.getRuntime());
-        if (patch.getTransport()    != null) cur.setTransport(patch.getTransport());
-        if (patch.getAuth()         != null) cur.setAuth(patch.getAuth());
-        if (patch.getAdvanced()     != null) cur.setAdvanced(patch.getAdvanced());
-        if (patch.getOwnerEmail()   != null) cur.setOwnerEmail(patch.getOwnerEmail());
-        if (patch.getWorkspaceId()  != null) cur.setWorkspaceId(patch.getWorkspaceId());
-        if (patch.getOnboardingId() != null) cur.setOnboardingId(patch.getOnboardingId());
-        if (patch.getConnectorId()  != null) cur.setConnectorId(patch.getConnectorId());
-        if (patch.getOnboarding()   != null) cur.setOnboarding(patch.getOnboarding());
-        if (patch.getSource()       != null) cur.setSource(patch.getSource());
-        if (patch.getSpecMetadataId() != null) cur.setSpecMetadataId(patch.getSpecMetadataId());
-        if (patch.getSpecName()       != null) cur.setSpecName(patch.getSpecName());
-        if (patch.getSpecSource()     != null) cur.setSpecSource(patch.getSpecSource());
-        if (patch.getTestRunResults() != null) cur.setTestRunResults(patch.getTestRunResults());
+        boolean touched = false;
+        // Only write a section when its value actually changed — keeps
+        // updatedAt / versionKey / persistence churn tied to real edits.
+        if (patch.getIdentity()     != null && !sectionEq(patch.getIdentity(),     cur.getIdentity()))     { cur.setIdentity(patch.getIdentity());         touched = true; }
+        if (patch.getCapabilities() != null && !sectionEq(patch.getCapabilities(), cur.getCapabilities())) { cur.setCapabilities(patch.getCapabilities()); touched = true; }
+        if (patch.getRuntime()      != null && !sectionEq(patch.getRuntime(),      cur.getRuntime()))      { cur.setRuntime(patch.getRuntime());           touched = true; }
+        if (patch.getTransport()    != null && !sectionEq(patch.getTransport(),    cur.getTransport()))    { cur.setTransport(patch.getTransport());       touched = true; }
+        if (patch.getAuth()         != null && !sectionEq(patch.getAuth(),         cur.getAuth()))         { cur.setAuth(patch.getAuth());                 touched = true; }
+        if (patch.getAdvanced()     != null && !sectionEq(patch.getAdvanced(),     cur.getAdvanced()))     { cur.setAdvanced(patch.getAdvanced());         touched = true; }
+        if (patch.getOwnerEmail()   != null && !java.util.Objects.equals(patch.getOwnerEmail(),   cur.getOwnerEmail()))   { cur.setOwnerEmail(patch.getOwnerEmail());     touched = true; }
+        if (patch.getWorkspaceId()  != null && !java.util.Objects.equals(patch.getWorkspaceId(),  cur.getWorkspaceId()))  { cur.setWorkspaceId(patch.getWorkspaceId());   touched = true; }
+        if (patch.getOnboardingId() != null && !java.util.Objects.equals(patch.getOnboardingId(), cur.getOnboardingId())) { cur.setOnboardingId(patch.getOnboardingId()); touched = true; }
+        if (patch.getConnectorId()  != null && !java.util.Objects.equals(patch.getConnectorId(),  cur.getConnectorId()))  { cur.setConnectorId(patch.getConnectorId());   touched = true; }
+        if (patch.getOnboarding()   != null && !sectionEq(patch.getOnboarding(), cur.getOnboarding()))     { cur.setOnboarding(patch.getOnboarding());     touched = true; }
+        if (patch.getSource()       != null && !sectionEq(patch.getSource(),     cur.getSource()))         { cur.setSource(patch.getSource());             touched = true; }
+        if (patch.getSpecMetadataId() != null && !java.util.Objects.equals(patch.getSpecMetadataId(), cur.getSpecMetadataId())) { cur.setSpecMetadataId(patch.getSpecMetadataId()); touched = true; }
+        if (patch.getSpecName()       != null && !java.util.Objects.equals(patch.getSpecName(),       cur.getSpecName()))       { cur.setSpecName(patch.getSpecName());       touched = true; }
+        if (patch.getSpecSource()     != null && !java.util.Objects.equals(patch.getSpecSource(),     cur.getSpecSource()))     { cur.setSpecSource(patch.getSpecSource());   touched = true; }
+        if (patch.getTestRunResults() != null && !sectionEq(patch.getTestRunResults(), cur.getTestRunResults()))               { cur.setTestRunResults(patch.getTestRunResults()); touched = true; }
+        if (!touched) return cur;   // genuine no-op — don't bump updatedAt or persist
         if (cur.getVersionNumber() != null && cur.getIdentity() != null && cur.getIdentity().getSlug() != null)
             cur.setVersionKey(versionKey(cur, cur.getVersionNumber()));
         cur.setUpdatedAt(Instant.now());
@@ -232,7 +271,7 @@ public class McpGenerationService {
         copy.setId(UUID.randomUUID().toString());
         copy.setCloneOf(src.getId());
         copy.setVersionOf(null);
-        String initialVersion = newVersion == null || newVersion.isBlank() ? "0.1.0" : newVersion.trim();
+        String initialVersion = newVersion == null || newVersion.isBlank() ? "1.0.0" : newVersion.trim();
         if (!initialVersion.matches("(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)"))
             throw new IllegalArgumentException("Clone version must be a release number such as 1.2.3");
         copy.setVersionNumber(initialVersion);
@@ -528,7 +567,11 @@ public class McpGenerationService {
     }
 
     private McpProject generateInto(McpProject p) {
-        com.forgesphere.mcpgen.generator.GeneratorUtils.validateResources(p);
+        // Backfills a default URI for any resource missing one (returns a
+        // review-warning per fix) instead of throwing and blocking the
+        // wizard — see GeneratorUtils.validateResources.
+        List<String> resourceWarnings =
+                com.forgesphere.mcpgen.generator.GeneratorUtils.validateResources(p);
         String lang = p.getRuntime() == null ? "typescript" : p.getRuntime().getLanguage();
         String transportKind = p.getTransport() == null ? "streamable-http" : p.getTransport().getKind();
         if ("java".equalsIgnoreCase(lang) && !"streamable-http".equals(transportKind))
@@ -538,6 +581,24 @@ public class McpGenerationService {
         String authKind = p.getAuth() == null ? "none" : p.getAuth().getKind();
         if (authKind != null && !List.of("none", "bearer", "api-key").contains(authKind))
             throw new IllegalArgumentException("OAuth/custom authentication requires a verified middleware implementation and cannot be generated yet.");
+        // Auto-provision the shared secret. bearer / api-key auth is the
+        // default, but clicking "Generate" on the token in the wizard is
+        // optional — and a state flush can lag the generate click, so the
+        // token may still be blank here even when the user did generate one.
+        // Either way, if it's blank we mint it now and persist it below.
+        // Without this the deploy bakes NO MCP_AUTH_TOKEN / MCP_API_KEY into
+        // mcp.yml and the deployed server 401s every request; minting here
+        // keeps the deployed env var and the value the Test page / inspector
+        // send in lock-step.
+        if (("bearer".equals(authKind) || "api-key".equals(authKind))
+                && (p.getAuth().getGeneratedToken() == null || p.getAuth().getGeneratedToken().isBlank())) {
+            p.getAuth().setGeneratedToken(
+                    com.forgesphere.mcpgen.generator.GeneratorUtils.randomToken());
+            resourceWarnings = new ArrayList<>(resourceWarnings);
+            resourceWarnings.add("No " + authKind + " token was set — generated one automatically. "
+                    + "It is baked into the deploy and shown on the Test page.");
+            log.info("Auto-generated {} token for MCP project {} (none was set)", authKind, p.getId());
+        }
         CodeGenerator gen = generators.stream()
                 .filter(g -> g.language().equalsIgnoreCase(lang))
                 .findFirst()
@@ -569,7 +630,8 @@ public class McpGenerationService {
         postProcessor.apply(p, files);
         int total = files.stream().mapToInt(f -> f.getBytes()).sum();
         p.setGenerated(Generated.builder()
-                .files(files).totalBytes(total).generatedAt(Instant.now()).build());
+                .files(files).totalBytes(total).generatedAt(Instant.now())
+                .warnings(resourceWarnings).build());
         // Invalidate any cached zip — the in-memory files have just
         // changed and the previously-uploaded archive (if any) is now
         // stale. Leaving it pointed at the old object meant downloads

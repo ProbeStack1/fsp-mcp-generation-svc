@@ -164,8 +164,12 @@ public class McpDesignValidator {
             McpProject.Resource res = resources.get(i);
             String basePath = "$.capabilities.resources[" + i + "]";
             if (res.getUriTemplate() == null || res.getUriTemplate().isBlank()) {
-                r.addError("resource.uri.missing", basePath + ".uriTemplate",
-                        "Resource URI template is required.");
+                // Non-blocking: generation backfills a default
+                // `resource://<name>` URI (GeneratorUtils.validateResources)
+                // and flags it for review, so this no longer fails design
+                // validation outright.
+                r.addWarning("resource.uri.missing", basePath + ".uriTemplate",
+                        "Resource has no URI — a default will be generated. Set one in Design → Resources to override.");
                 continue;
             }
             if (!seenUris.add(res.getUriTemplate())) {

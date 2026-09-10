@@ -453,6 +453,10 @@ public class McpProject {
         private String checksum;
         // ─── NEW: URL for the scenario-based test collection (Postman + metadata) ───
         private String testCollectionUrl;
+        // Non-fatal notes from the last generate the UI should surface for
+        // review — e.g. a resource whose missing URI was auto-filled, or a
+        // bearer token that was auto-generated because none was set.
+        @Builder.Default private List<String> warnings = List.of();
     }
 
     @Data @Builder @NoArgsConstructor @AllArgsConstructor

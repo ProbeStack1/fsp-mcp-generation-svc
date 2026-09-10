@@ -3,25 +3,16 @@ name: CI/CD - ${slug} Deploy to Cloud Run
 
 on:
   push:
+    # Feature branch (${devBranch}) + the CICD "merge"-tagged branch
+    # (${branchTag}, e.g. release) — the second line is injected only when
+    # that branch is resolvable. No pull_request trigger: deploy fires on
+    # push to either branch.
     branches:
-      - ${devBranch}
+      - ${devBranch}${extraPushBranches}
     # Skip the deploy pipeline when the only changes are docs / markdown
     # / git metadata — these never affect the deployed image and were
     # firing wasteful runs on single-file edits (e.g. README touch-ups).
     # Source / Dockerfile / package manifest changes still trigger.
-    paths-ignore:
-      - '**/*.md'
-      - 'docs/**'
-      - '.gitignore'
-      - '.github/CODEOWNERS'
-      - 'LICENSE'
-      - '.editorconfig'
-      - '.vscode/**'
-      - '.idea/**'
-  pull_request:
-    branches:
-      - ${devBranch}
-    types: [opened, synchronize, reopened]
     paths-ignore:
       - '**/*.md'
       - 'docs/**'
@@ -56,8 +47,7 @@ env:
   #   branch_tag     — CICD default-strategy "merge" branch name (e.g. release).
   #   cicd_config_id — id for the CICD filtered-config API (/cicd-config/{id}/all).
   branch_name:                   ${{ github.ref_name }}
-  branch_tag:                    "${branchTag}"
-  cicd_config_id:                "${cicdConfigId}"
+p  cicd_config_id:                "${cicdConfigId}"
 
 jobs:
   # ───────────────────────────── 1. Test ─────────────────────────────
@@ -74,7 +64,7 @@ ${langSteps}
     name: deploy-to-cloud-run
     needs: test
     runs-on: ubuntu-latest
-    if: github.event_name == 'push' && github.ref == 'refs/heads/${devBranch}'
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/${devBranch}' || github.ref == 'refs/heads/${branchTag}')
 
     permissions:
       contents: read
