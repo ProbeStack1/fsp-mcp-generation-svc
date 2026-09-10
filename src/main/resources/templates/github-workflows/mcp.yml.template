@@ -47,7 +47,7 @@ env:
   #   branch_tag     — CICD default-strategy "merge" branch name (e.g. release).
   #   cicd_config_id — id for the CICD filtered-config API (/cicd-config/{id}/all).
   branch_name:                   ${{ github.ref_name }}
-p  cicd_config_id:                "${cicdConfigId}"
+  cicd_config_id:                "${cicdConfigId}"
 
 jobs:
   # ───────────────────────────── 1. Test ─────────────────────────────
